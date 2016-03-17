@@ -320,6 +320,12 @@ struct xlate_ctx {
     struct ofpbuf frozen_actions;
     const struct ofpact_controller *pause;
 
+    /* True if a packet was but is no longer MPLS (due to an MPLS pop action).
+     * This is a trigger for recirculation in cases where translating an action
+     * or looking up a flow requires access to the fields of the packet after
+     * the MPLS label stack that was originally present. */
+    bool was_mpls;
+
     /* True if conntrack has been performed on this packet during processing
      * on the current bridge. This is used to determine whether conntrack
      * state from the datapath should be honored after thawing. */
@@ -2996,6 +3002,7 @@ compose_output_action__(struct xlate_ctx *ctx, ofp_port_t ofp_port,
         const struct xport *peer = xport->peer;
         struct flow old_flow = ctx->xin->flow;
         bool old_conntrack = ctx->conntracked;
+        bool old_was_mpls = ctx->was_mpls;
         cls_version_t old_version = ctx->tables_version;
         struct ofpbuf old_stack = ctx->stack;
         union mf_subvalue new_stack[1024 / sizeof(union mf_subvalue)];
@@ -3052,6 +3059,10 @@ compose_output_action__(struct xlate_ctx *ctx, ofp_port_t ofp_port,
 
         /* Restore calling bridge's lookup version. */
         ctx->tables_version = old_version;
+
+        /* The peer bridge popping MPLS should have no effect on the original
+         * bridge. */
+        ctx->was_mpls = old_was_mpls;
 
         /* The peer bridge's conntrack execution should have no effect on the
          * original bridge. */
@@ -3270,6 +3281,11 @@ static void
 xlate_table_action(struct xlate_ctx *ctx, ofp_port_t in_port, uint8_t table_id,
                    bool may_packet_in, bool honor_table_miss)
 {
+    /* Check if we need to recirculate before matching in a table. */
+    if (ctx->was_mpls) {
+        ctx_trigger_freeze(ctx);
+        return;
+    }
     if (xlate_resubmit_resource_check(ctx)) {
         uint8_t old_table_id = ctx->table_id;
         struct rule_dpif *rule;
@@ -3331,6 +3347,7 @@ xlate_group_bucket(struct xlate_ctx *ctx, struct ofputil_bucket *bucket)
     struct ofpbuf action_set = ofpbuf_const_initializer(bucket->ofpacts,
                                                         bucket->ofpacts_len);
     struct flow old_flow = ctx->xin->flow;
+    bool old_was_mpls = ctx->was_mpls;
 
     ofpacts_execute_action_set(&action_list, &action_set);
     ctx->recurse++;
@@ -3359,6 +3376,10 @@ xlate_group_bucket(struct xlate_ctx *ctx, struct ofputil_bucket *bucket)
      * with the action_set and stack in the tables resubmitted to from
      * group buckets. */
     ctx->xin->flow = old_flow;
+
+    /* The group bucket popping MPLS should have no effect after bucket
+     * execution. */
+    ctx->was_mpls = old_was_mpls;
 
     /* The fact that the group bucket exits (for any reason) does not mean that
      * the translation after the group action should exit.  Specifically, if
@@ -3774,8 +3795,8 @@ compose_mpls_pop_action(struct xlate_ctx *ctx, ovs_be16 eth_type)
     int n = flow_count_mpls_labels(flow, ctx->wc);
 
     if (flow_pop_mpls(flow, n, eth_type, ctx->wc)) {
-        if (!eth_type_mpls(eth_type) && ctx->xbridge->support.odp.recirc) {
-            ctx_trigger_freeze(ctx);
+        if (ctx->xbridge->support.odp.recirc) {
+            ctx->was_mpls = true;
         }
     } else if (n >= FLOW_MAX_MPLS_LABELS) {
         if (ctx->xin->packet != NULL) {
@@ -4291,6 +4312,16 @@ freeze_unroll_actions(const struct ofpact *a, const struct ofpact *end,
     }
 }
 
+#define CHECK_MPLS_RECIRCULATION()      \
+    if (ctx->was_mpls) {                \
+        ctx_trigger_freeze(ctx);        \
+        break;                          \
+    }
+#define CHECK_MPLS_RECIRCULATION_IF(COND) \
+    if (COND) {                           \
+        CHECK_MPLS_RECIRCULATION();       \
+    }
+
 static void
 put_ct_mark(const struct flow *flow, struct flow *base_flow,
             struct ofpbuf *odp_actions, struct flow_wildcards *wc)
@@ -4556,6 +4587,7 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
             break;
 
         case OFPACT_SET_IPV4_SRC:
+            CHECK_MPLS_RECIRCULATION();
             if (flow->dl_type == htons(ETH_TYPE_IP)) {
                 memset(&wc->masks.nw_src, 0xff, sizeof wc->masks.nw_src);
                 flow->nw_src = ofpact_get_SET_IPV4_SRC(a)->ipv4;
@@ -4563,6 +4595,7 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
             break;
 
         case OFPACT_SET_IPV4_DST:
+            CHECK_MPLS_RECIRCULATION();
             if (flow->dl_type == htons(ETH_TYPE_IP)) {
                 memset(&wc->masks.nw_dst, 0xff, sizeof wc->masks.nw_dst);
                 flow->nw_dst = ofpact_get_SET_IPV4_DST(a)->ipv4;
@@ -4570,6 +4603,7 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
             break;
 
         case OFPACT_SET_IP_DSCP:
+            CHECK_MPLS_RECIRCULATION();
             if (is_ip_any(flow)) {
                 wc->masks.nw_tos |= IP_DSCP_MASK;
                 flow->nw_tos &= ~IP_DSCP_MASK;
@@ -4578,6 +4612,7 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
             break;
 
         case OFPACT_SET_IP_ECN:
+            CHECK_MPLS_RECIRCULATION();
             if (is_ip_any(flow)) {
                 wc->masks.nw_tos |= IP_ECN_MASK;
                 flow->nw_tos &= ~IP_ECN_MASK;
@@ -4586,6 +4621,7 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
             break;
 
         case OFPACT_SET_IP_TTL:
+            CHECK_MPLS_RECIRCULATION();
             if (is_ip_any(flow)) {
                 wc->masks.nw_ttl = 0xff;
                 flow->nw_ttl = ofpact_get_SET_IP_TTL(a)->ttl;
@@ -4593,6 +4629,7 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
             break;
 
         case OFPACT_SET_L4_SRC_PORT:
+            CHECK_MPLS_RECIRCULATION();
             if (is_ip_any(flow) && !(flow->nw_frag & FLOW_NW_FRAG_LATER)) {
                 memset(&wc->masks.nw_proto, 0xff, sizeof wc->masks.nw_proto);
                 memset(&wc->masks.tp_src, 0xff, sizeof wc->masks.tp_src);
@@ -4601,6 +4638,7 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
             break;
 
         case OFPACT_SET_L4_DST_PORT:
+            CHECK_MPLS_RECIRCULATION();
             if (is_ip_any(flow) && !(flow->nw_frag & FLOW_NW_FRAG_LATER)) {
                 memset(&wc->masks.nw_proto, 0xff, sizeof wc->masks.nw_proto);
                 memset(&wc->masks.tp_dst, 0xff, sizeof wc->masks.tp_dst);
@@ -4609,13 +4647,28 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
             break;
 
         case OFPACT_RESUBMIT:
-            /* Freezing complicates resubmit.  Some action in the flow
-             * entry found by resubmit might trigger freezing.  If that
-             * happens, then we do not want to execute the resubmit again after
-             * during thawing, so we want to skip back to the head of the loop
-             * to avoid that, only adding any actions that follow the resubmit
-             * to the frozen actions.
+            /* Freezing complicates resubmit.  There are two cases:
+             *
+             *     - If mpls_pop has been executed, then the flow table lookup
+             *       as part of resubmit might depend on fields that can only
+             *       be obtained via recirculation, so the resubmit itself
+             *       triggers recirculation and we need to make sure that the
+             *       resubmit is executed again after recirculation.
+             *       Therefore, in this case we trigger recirculation and let
+             *       the code following this "switch" append the resubmit to
+             *       the post-recirculation actions.
+             *
+             *     - Otherwise, some action in the flow entry found by resubmit
+             *       might trigger freezing.  If that happens, then we do not
+             *       want to execute the resubmit again during thawing, so we
+             *       want to skip back to the head of the loop to avoid that,
+             *       only adding any actions that follow the resubmit to the
+             *       frozen actions.
              */
+            if (ctx->was_mpls) {
+                ctx_trigger_freeze(ctx);
+                break;
+            }
             xlate_ofpact_resubmit(ctx, ofpact_get_RESUBMIT(a));
             continue;
 
@@ -4636,10 +4689,15 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
             break;
 
         case OFPACT_REG_MOVE:
+            CHECK_MPLS_RECIRCULATION_IF(
+                mf_is_l3_or_higher(ofpact_get_REG_MOVE(a)->dst.field) ||
+                mf_is_l3_or_higher(ofpact_get_REG_MOVE(a)->src.field));
             nxm_execute_reg_move(ofpact_get_REG_MOVE(a), flow, wc);
             break;
 
         case OFPACT_SET_FIELD:
+            CHECK_MPLS_RECIRCULATION_IF(
+                mf_is_l3_or_higher(ofpact_get_SET_FIELD(a)->field));
             set_field = ofpact_get_SET_FIELD(a);
             mf = set_field->field;
 
@@ -4665,43 +4723,62 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
             break;
 
         case OFPACT_STACK_PUSH:
+            CHECK_MPLS_RECIRCULATION_IF(
+                mf_is_l3_or_higher(ofpact_get_STACK_PUSH(a)->subfield.field));
             nxm_execute_stack_push(ofpact_get_STACK_PUSH(a), flow, wc,
                                    &ctx->stack);
             break;
 
         case OFPACT_STACK_POP:
+            CHECK_MPLS_RECIRCULATION_IF(
+                mf_is_l3_or_higher(ofpact_get_STACK_POP(a)->subfield.field));
             nxm_execute_stack_pop(ofpact_get_STACK_POP(a), flow, wc,
                                   &ctx->stack);
             break;
 
         case OFPACT_PUSH_MPLS:
+            /* Recirculate if it is an IP packet with a zero ttl.  This may
+             * indicate that the packet was previously MPLS and an MPLS pop
+             * action converted it to IP. In this case recirculating should
+             * reveal the IP TTL which is used as the basis for a new MPLS
+             * LSE. */
+            CHECK_MPLS_RECIRCULATION_IF(
+                !flow_count_mpls_labels(flow, wc)
+                && flow->nw_ttl == 0
+                && is_ip_any(flow));
             compose_mpls_push_action(ctx, ofpact_get_PUSH_MPLS(a));
             break;
 
         case OFPACT_POP_MPLS:
+            CHECK_MPLS_RECIRCULATION();
             compose_mpls_pop_action(ctx, ofpact_get_POP_MPLS(a)->ethertype);
             break;
 
         case OFPACT_SET_MPLS_LABEL:
+            CHECK_MPLS_RECIRCULATION();
             compose_set_mpls_label_action(
                 ctx, ofpact_get_SET_MPLS_LABEL(a)->label);
             break;
 
         case OFPACT_SET_MPLS_TC:
+            CHECK_MPLS_RECIRCULATION();
             compose_set_mpls_tc_action(ctx, ofpact_get_SET_MPLS_TC(a)->tc);
             break;
 
         case OFPACT_SET_MPLS_TTL:
+            CHECK_MPLS_RECIRCULATION();
             compose_set_mpls_ttl_action(ctx, ofpact_get_SET_MPLS_TTL(a)->ttl);
             break;
 
         case OFPACT_DEC_MPLS_TTL:
+            CHECK_MPLS_RECIRCULATION();
             if (compose_dec_mpls_ttl_action(ctx)) {
                 return;
             }
             break;
 
         case OFPACT_DEC_TTL:
+            CHECK_MPLS_RECIRCULATION();
             wc->masks.nw_ttl = 0xff;
             if (compose_dec_ttl(ctx, ofpact_get_DEC_TTL(a))) {
                 return;
@@ -4713,10 +4790,12 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
             break;
 
         case OFPACT_MULTIPATH:
+            CHECK_MPLS_RECIRCULATION();
             multipath_execute(ofpact_get_MULTIPATH(a), flow, wc);
             break;
 
         case OFPACT_BUNDLE:
+            CHECK_MPLS_RECIRCULATION();
             xlate_bundle_action(ctx, ofpact_get_BUNDLE(a));
             break;
 
@@ -4725,6 +4804,7 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
             break;
 
         case OFPACT_LEARN:
+            CHECK_MPLS_RECIRCULATION();
             xlate_learn_action(ctx, ofpact_get_LEARN(a));
             break;
 
@@ -4751,6 +4831,7 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
             break;
         }
         case OFPACT_FIN_TIMEOUT:
+            CHECK_MPLS_RECIRCULATION();
             memset(&wc->masks.nw_proto, 0xff, sizeof wc->masks.nw_proto);
             xlate_fin_timeout(ctx, ofpact_get_FIN_TIMEOUT(a));
             break;
@@ -4790,6 +4871,7 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
             break;
 
         case OFPACT_CT:
+            CHECK_MPLS_RECIRCULATION();
             compose_conntrack_action(ctx, ofpact_get_CT(a));
             break;
 
@@ -5118,6 +5200,7 @@ xlate_actions(struct xlate_in *xin, struct xlate_out *xout)
         .frozen_actions = OFPBUF_STUB_INITIALIZER(frozen_actions_stub),
         .pause = NULL,
 
+        .was_mpls = false,
         .conntracked = false,
 
         .ct_nat_action = NULL,
