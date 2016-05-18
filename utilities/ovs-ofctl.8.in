@@ -1218,13 +1218,15 @@ For non-tunneled packets, the value is 0.
 .IP
 This field was introduced in Open vSwitch 2.5.
 .
-.IP \fBtun_src=\fIip\fR[\fB/\fInetmask\fR]
-.IQ \fBtun_dst=\fIip\fR[\fB/\fInetmask\fR]
-Matches tunnel IPv4 source (or destination) address \fIip\fR. Only packets
+.IP \fBtun_src=\fIipv4\fR[\fB/\fInetmask\fR]
+.IQ \fBtun_dst=\fIipv4\fR[\fB/\fInetmask\fR]
+.IQ \fBtun_ipv6_src=\fIipv6\fR[\fB/\fInetmask\fR]
+.IQ \fBtun_ipv6_dst=\fIipv6\fR[\fB/\fInetmask\fR]
+Matches tunnel IP source (or destination) address \fIip\fR. Only packets
 that arrive over a tunnel will have nonzero tunnel addresses.
 The address may be specified as an IP address or host name
 (e.g. \fB192.168.1.1\fR or \fBwww.example.com\fR).  The optional
-\fInetmask\fR allows restricting a match to a masked IPv4 address.
+\fInetmask\fR allows restricting a match to a masked IP address.
 The netmask may be specified as a dotted quad
 (e.g. \fB192.168.1.0/255.255.255.0\fR) or as a CIDR block
 (e.g. \fB192.168.1.0/24\fR).
@@ -1659,10 +1661,30 @@ specified by \fItable\fR) with the \fBin_port\fR field replaced by
 \fIport\fR (if \fIport\fR is specified) and executes the actions
 found, if any, in addition to any other actions in this flow entry.
 .IP
-Recursive \fBresubmit\fR actions are obeyed up to an
-implementation-defined maximum depth.  Open vSwitch 1.0.1 and earlier
-did not support recursion; Open vSwitch before 1.2.90 did not support
-\fItable\fR.
+Recursive \fBresubmit\fR actions are obeyed up to
+implementation-defined limits:
+.RS
+.IP \(bu
+Open vSwitch 1.0.1 and earlier did not support recursion.
+.IP \(bu
+Open vSwitch 1.0.2 and 1.0.3 limited recursion to 8 levels.
+.IP \(bu
+Open vSwitch 1.1 and 1.2 limited recursion to 16 levels.
+.IP \(bu
+Open vSwitch 1.2 through 1.8 limited recursion to 32 levels.
+.IP \(bu
+Open vSwitch 1.9 through 2.0 limited recursion to 64 levels.
+.IP \(bu
+Open vSwitch 2.1 through 2.5 limited recursion to 64 levels and impose
+a total limit of 4,096 resubmits per flow translation (earlier versions
+did not impose any total limit).
+.IP \(bu
+Open vSwitch 2.6 and later imposes the same limits as 2.5, with one
+exception: \fBresubmit\fR from table \fIx\fR to any table \fIy\fR >
+\fIx\fR does not count against the recursion limit.
+.RE
+.IP
+Open vSwitch before 1.2.90 did not support \fItable\fR.
 .
 .IP \fBset_tunnel\fB:\fIid\fR
 .IQ \fBset_tunnel64\fB:\fIid\fR
@@ -1723,12 +1745,12 @@ fields are accepted within the \fBexec\fR action, and these fields may only be
 modified with this option. For example:
 .
 .RS
-.IP \fBset_field:\fIvalue\fR->ct_mark\fR
+.IP \fBset_field:\fIvalue\fR[\fB/\fImask\fR]->ct_mark\fR
 Store a 32-bit metadata value with the connection. If the connection is
 committed, then subsequent lookups for packets in this connection will
 populate the \fBct_mark\fR flow field when the packet is sent to the
 connection tracker with the \fBtable\fR specified.
-.IP \fBset_field:\fIvalue\fR->ct_label\fR
+.IP \fBset_field:\fIvalue\fR[\fB/\fImask\fR]->ct_label\fR
 Store a 128-bit metadata value with the connection.  If the connection is
 committed, then subsequent lookups for packets in this connection will
 populate the \fBct_label\fR flow field when the packet is sent to the
@@ -2968,6 +2990,7 @@ These options currently affect only \fBdump\-flows\fR output.
 .SS "Public Key Infrastructure Options"
 .so lib/ssl.man
 .so lib/vlog.man
+.so lib/colors.man
 .so lib/common.man
 .
 .SH "RUNTIME MANAGEMENT COMMANDS"

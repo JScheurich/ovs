@@ -34,7 +34,7 @@
 
 #include "bitmap.h"
 #include "dpif-provider.h"
-#include "dynamic-string.h"
+#include "openvswitch/dynamic-string.h"
 #include "flow.h"
 #include "fat-rwlock.h"
 #include "netdev.h"
@@ -45,7 +45,7 @@
 #include "netlink-socket.h"
 #include "netlink.h"
 #include "odp-util.h"
-#include "ofpbuf.h"
+#include "openvswitch/ofpbuf.h"
 #include "packets.h"
 #include "poll-loop.h"
 #include "random.h"
@@ -2400,9 +2400,9 @@ dpif_netlink_init(void)
         error = nl_lookup_genl_family(OVS_DATAPATH_FAMILY,
                                       &ovs_datapath_family);
         if (error) {
-            VLOG_ERR("Generic Netlink family '%s' does not exist. "
-                     "The Open vSwitch kernel module is probably not loaded.",
-                     OVS_DATAPATH_FAMILY);
+            VLOG_WARN("Generic Netlink family '%s' does not exist. "
+                      "The Open vSwitch kernel module is probably not loaded.",
+                      OVS_DATAPATH_FAMILY);
         }
         if (!error) {
             error = nl_lookup_genl_family(OVS_VPORT_FAMILY, &ovs_vport_family);

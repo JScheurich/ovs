@@ -29,7 +29,7 @@
 #include "compiler.h"
 #include "daemon.h"
 #include "dirs.h"
-#include "dynamic-string.h"
+#include "openvswitch/dynamic-string.h"
 #include "encaps.h"
 #include "fatal-signal.h"
 #include "hmap.h"
@@ -44,6 +44,8 @@
 #include "physical.h"
 #include "pinctrl.h"
 #include "poll-loop.h"
+#include "lib/bitmap.h"
+#include "lib/hash.h"
 #include "smap.h"
 #include "stream-ssl.h"
 #include "stream.h"
@@ -61,6 +63,25 @@ static void parse_options(int argc, char *argv[]);
 OVS_NO_RETURN static void usage(void);
 
 static char *ovs_remote;
+
+struct local_datapath *
+get_local_datapath(const struct hmap *local_datapaths, uint32_t tunnel_key)
+{
+    struct hmap_node *node = hmap_first_with_hash(local_datapaths, tunnel_key);
+    return (node
+            ? CONTAINER_OF(node, struct local_datapath, hmap_node)
+            : NULL);
+}
+
+struct patched_datapath *
+get_patched_datapath(const struct hmap *patched_datapaths, uint32_t tunnel_key)
+{
+    struct hmap_node *node = hmap_first_with_hash(patched_datapaths,
+                                                  tunnel_key);
+    return (node
+            ? CONTAINER_OF(node, struct patched_datapath, hmap_node)
+            : NULL);
+}
 
 const struct sbrec_chassis *
 get_chassis(struct ovsdb_idl *ovnsb_idl, const char *chassis_id)
@@ -169,7 +190,14 @@ static const char *
 get_chassis_id(const struct ovsdb_idl *ovs_idl)
 {
     const struct ovsrec_open_vswitch *cfg = ovsrec_open_vswitch_first(ovs_idl);
-    return cfg ? smap_get(&cfg->external_ids, "system-id") : NULL;
+    const char *chassis_id = cfg ? smap_get(&cfg->external_ids, "system-id") : NULL;
+
+    if (!chassis_id) {
+        static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(5, 1);
+        VLOG_WARN_RL(&rl, "'system-id' in Open_vSwitch database is missing.");
+    }
+
+    return chassis_id;
 }
 
 /* Retrieves the OVN Southbound remote location from the
@@ -196,6 +224,32 @@ get_ovnsb_remote(struct ovsdb_idl *ovs_idl)
         ovsdb_idl_wait(ovs_idl);
         poll_block();
     }
+}
+
+/* Retrieves the OVN Southbound remote's json session probe interval from the
+ * "external-ids:ovn-remote-probe-interval" key in 'ovs_idl' and returns it.
+ *
+ * This function must be called after get_ovnsb_remote(). */
+static bool
+get_ovnsb_remote_probe_interval(struct ovsdb_idl *ovs_idl, int *value)
+{
+    const struct ovsrec_open_vswitch *cfg = ovsrec_open_vswitch_first(ovs_idl);
+    if (!cfg) {
+        return false;
+    }
+
+    const char *probe_interval =
+        smap_get(&cfg->external_ids, "ovn-remote-probe-interval");
+    if (probe_interval) {
+        if (str_to_int(probe_interval, 10, value)) {
+            return true;
+        }
+
+        VLOG_WARN("Invalid value for OVN remote probe interval: %s",
+                  probe_interval);
+    }
+
+    return false;
 }
 
 int
@@ -261,9 +315,15 @@ main(int argc, char *argv[])
         ovsdb_idl_create(ovnsb_remote, &sbrec_idl_class, true, true));
     ovsdb_idl_get_initial_snapshot(ovnsb_idl_loop.idl);
 
+    int probe_interval = 0;
+    if (get_ovnsb_remote_probe_interval(ovs_idl_loop.idl, &probe_interval)) {
+        ovsdb_idl_set_probe_interval(ovnsb_idl_loop.idl, probe_interval);
+    }
+
     /* Initialize connection tracking zones. */
     struct simap ct_zones = SIMAP_INITIALIZER(&ct_zones);
     unsigned long ct_zone_bitmap[BITMAP_N_LONGS(MAX_CT_ZONES)];
+    memset(ct_zone_bitmap, 0, sizeof ct_zone_bitmap);
     bitmap_set1(ct_zone_bitmap, 0); /* Zone 0 is reserved. */
     unixctl_command_register("ct-zone-list", "", 0, 0,
                              ct_zone_list, &ct_zones);
@@ -271,6 +331,16 @@ main(int argc, char *argv[])
     /* Main loop. */
     exiting = false;
     while (!exiting) {
+        /* Check OVN SB database. */
+        char *new_ovnsb_remote = get_ovnsb_remote(ovs_idl_loop.idl);
+        if (strcmp(ovnsb_remote, new_ovnsb_remote)) {
+            free(ovnsb_remote);
+            ovnsb_remote = new_ovnsb_remote;
+            ovsdb_idl_set_remote(ovnsb_idl_loop.idl, ovnsb_remote, true);
+        } else {
+            free(new_ovnsb_remote);
+        }
+
         struct controller_ctx ctx = {
             .ovs_idl = ovs_idl_loop.idl,
             .ovs_idl_txn = ovsdb_idl_loop_run(&ovs_idl_loop),
@@ -281,6 +351,8 @@ main(int argc, char *argv[])
         /* Contains "struct local_datpath" nodes whose hash values are the
          * tunnel_key of datapaths with at least one local port binding. */
         struct hmap local_datapaths = HMAP_INITIALIZER(&local_datapaths);
+
+        struct hmap patched_datapaths = HMAP_INITIALIZER(&patched_datapaths);
 
         const struct ovsrec_bridge *br_int = get_br_int(&ctx);
         const char *chassis_id = get_chassis_id(ctx.ovs_idl);
@@ -293,7 +365,7 @@ main(int argc, char *argv[])
         }
 
         if (br_int) {
-            patch_run(&ctx, br_int, &local_datapaths);
+            patch_run(&ctx, br_int, &local_datapaths, &patched_datapaths);
 
             struct lport_index lports;
             struct mcgroup_index mcgroups;
@@ -302,15 +374,15 @@ main(int argc, char *argv[])
 
             enum mf_field_id mff_ovn_geneve = ofctrl_run(br_int);
 
-            pinctrl_run(&ctx, &lports, br_int);
+            pinctrl_run(&ctx, &lports, br_int, chassis_id, &local_datapaths);
 
             struct hmap flow_table = HMAP_INITIALIZER(&flow_table);
             lflow_run(&ctx, &lports, &mcgroups, &local_datapaths,
-                      &ct_zones, &flow_table);
+                      &patched_datapaths, &ct_zones, &flow_table);
             if (chassis_id) {
                 physical_run(&ctx, mff_ovn_geneve,
                              br_int, chassis_id, &ct_zones, &flow_table,
-                             &local_datapaths);
+                             &local_datapaths, &patched_datapaths);
             }
             ofctrl_put(&flow_table);
             hmap_destroy(&flow_table);
@@ -324,6 +396,14 @@ main(int argc, char *argv[])
             free(cur_node);
         }
         hmap_destroy(&local_datapaths);
+
+        struct patched_datapath *pd_cur_node, *pd_next_node;
+        HMAP_FOR_EACH_SAFE (pd_cur_node, pd_next_node, hmap_node,
+                &patched_datapaths) {
+            hmap_remove(&patched_datapaths, &pd_cur_node->hmap_node);
+            free(pd_cur_node);
+        }
+        hmap_destroy(&patched_datapaths);
 
         unixctl_server_run(unixctl);
 

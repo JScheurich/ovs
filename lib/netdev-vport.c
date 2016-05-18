@@ -32,11 +32,11 @@
 #include "dirs.h"
 #include "dpif.h"
 #include "dp-packet.h"
-#include "dynamic-string.h"
+#include "openvswitch/dynamic-string.h"
 #include "flow.h"
 #include "hash.h"
 #include "hmap.h"
-#include "list.h"
+#include "openvswitch/list.h"
 #include "netdev-provider.h"
 #include "odp-netlink.h"
 #include "dp-packet.h"
@@ -319,7 +319,7 @@ tunnel_check_status_change__(struct netdev_vport *netdev)
 
     iface[0] = '\0';
     route = &netdev->tnl_cfg.ipv6_dst;
-    if (ovs_router_lookup(route, iface, &gw)) {
+    if (ovs_router_lookup(route, iface, NULL, &gw)) {
         struct netdev *egress_netdev;
 
         if (!netdev_open(iface, "system", &egress_netdev)) {
@@ -504,10 +504,6 @@ set_tunnel_config(struct netdev *dev_, const struct smap *args)
                           name, node->value);
                 return EINVAL;
             }
-            if (dst_proto == ETH_TYPE_IPV6) {
-                VLOG_WARN("%s: IPv6 'remote_ip' is not supported", name);
-                return EOPNOTSUPP;
-            }
         } else if (!strcmp(node->key, "local_ip")) {
             int err;
             err = parse_tunnel_ip(node->value, true, &tnl_cfg.ip_src_flow,
@@ -516,10 +512,6 @@ set_tunnel_config(struct netdev *dev_, const struct smap *args)
             case ENOENT:
                 VLOG_WARN("%s: bad %s 'local_ip'", name, type);
                 break;
-            }
-            if (src_proto == ETH_TYPE_IPV6) {
-                VLOG_WARN("%s: IPv6 'local_ip' is not supported", name);
-                return EOPNOTSUPP;
             }
         } else if (!strcmp(node->key, "tos")) {
             if (!strcmp(node->value, "inherit")) {
@@ -859,7 +851,11 @@ get_stats(const struct netdev *netdev, struct netdev_stats *stats)
     struct netdev_vport *dev = netdev_vport_cast(netdev);
 
     ovs_mutex_lock(&dev->mutex);
-    *stats = dev->stats;
+    /* Passing only collected counters */
+    stats->tx_packets = dev->stats.tx_packets;
+    stats->tx_bytes = dev->stats.tx_bytes;
+    stats->rx_packets = dev->stats.rx_packets;
+    stats->rx_bytes = dev->stats.rx_bytes;
     ovs_mutex_unlock(&dev->mutex);
 
     return 0;
@@ -1528,9 +1524,8 @@ netdev_vport_range(struct unixctl_conn *conn, int argc,
     NULL,                       /* queue_dump_done */       \
     NULL,                       /* dump_queue_stats */      \
                                                             \
-    NULL,                       /* get_in4 */               \
     NULL,                       /* set_in4 */               \
-    NULL,                       /* get_in6 */               \
+    NULL,                       /* get_addr_list */         \
     NULL,                       /* add_router */            \
     NULL,                       /* get_next_hop */          \
     GET_STATUS,                                             \

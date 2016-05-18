@@ -26,14 +26,14 @@
 #include "command-line.h"
 #include "daemon.h"
 #include "dirs.h"
-#include "dynamic-string.h"
+#include "openvswitch/dynamic-string.h"
 #include "fatal-signal.h"
 #include "file.h"
 #include "hash.h"
 #include "json.h"
 #include "jsonrpc.h"
 #include "jsonrpc-server.h"
-#include "list.h"
+#include "openvswitch/list.h"
 #include "memory.h"
 #include "monitor.h"
 #include "ovsdb.h"
@@ -196,6 +196,7 @@ main_loop(struct ovsdb_jsonrpc_server *jsonrpc, struct shash *all_dbs,
         }
     }
 
+    free(remotes_error);
 }
 
 int

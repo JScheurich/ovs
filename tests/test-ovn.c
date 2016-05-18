@@ -15,15 +15,17 @@
  */
 
 #include <config.h>
-#include "command-line.h"
 #include <errno.h>
 #include <getopt.h>
 #include <sys/wait.h>
-#include "dynamic-string.h"
+#include "command-line.h"
 #include "fatal-signal.h"
-#include "match.h"
-#include "ofp-actions.h"
-#include "ofpbuf.h"
+#include "flow.h"
+#include "openvswitch/dynamic-string.h"
+#include "openvswitch/match.h"
+#include "openvswitch/ofp-actions.h"
+#include "openvswitch/ofpbuf.h"
+#include "openvswitch/vlog.h"
 #include "ovn/lib/actions.h"
 #include "ovn/lib/expr.h"
 #include "ovn/lib/lex.h"
@@ -32,7 +34,6 @@
 #include "shash.h"
 #include "simap.h"
 #include "util.h"
-#include "openvswitch/vlog.h"
 
 /* --relops: Bitmap of the relational operators to test, in exhaustive test. */
 static unsigned int test_relops;
@@ -841,7 +842,7 @@ build_simple_tree(enum expr_type type, int n, struct expr ***terminalp)
         struct expr *e = expr_create_andor(type);
         for (int i = 0; i < 2; i++) {
             struct expr *sub = make_terminal(terminalp);
-            list_push_back(&e->andor, &sub->node);
+            ovs_list_push_back(&e->andor, &sub->node);
         }
         return e;
     } else if (n == 1) {
@@ -864,7 +865,7 @@ build_tree_shape(enum expr_type type, const struct tree_shape **tsp,
         struct expr *sub = (ts->s[i] > 2
                             ? build_tree_shape(t, tsp, terminalp)
                             : build_simple_tree(t, ts->s[i], terminalp));
-        list_push_back(&e->andor, &sub->node);
+        ovs_list_push_back(&e->andor, &sub->node);
     }
     return e;
 }

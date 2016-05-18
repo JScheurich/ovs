@@ -99,12 +99,15 @@ EXTRA_DIST = \
 	$(docs) \
 	NOTICE \
 	.travis.yml \
-	.travis/build.sh \
-	.travis/prepare.sh \
+	.travis/linux-build.sh \
+	.travis/linux-prepare.sh \
+	.travis/osx-build.sh \
+	.travis/osx-prepare.sh \
 	appveyor.yml \
 	boot.sh \
 	build-aux/cccl \
 	build-aux/cksum-schema-check \
+	build-aux/calculate-schema-cksum \
 	build-aux/dist-docs \
 	build-aux/sodepends.pl \
 	build-aux/soexpand.pl \

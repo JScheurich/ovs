@@ -30,7 +30,6 @@ prt==1 { sub(/[ \t]*$/, ""); print $0 }
 vconn_sub() {
     sed '
 s/tcp:127.0.0.1:[0-9][0-9]*:/unix:/
-s/No error/Success/
 '
 }
 ]
@@ -104,7 +103,7 @@ sim_add () {
 # "as $1 COMMAND..." sets those variables in a subshell and invokes COMMAND
 # there.
 as() {
-    if test "X$1" != X; then
+    if test "X$2" != X; then
         (ovs_setenv $1; shift; $@)
     else
         ovs_setenv $1
@@ -282,7 +281,8 @@ m4_define([_OVS_VSWITCHD_START],
 /reconnect|INFO|/d
 /ofproto|INFO|using datapath ID/d
 /netdev_linux|INFO|.*device has unknown hardware address family/d
-/ofproto|INFO|datapath ID changed to fedcba9876543210/d']])
+/ofproto|INFO|datapath ID changed to fedcba9876543210/d
+/dpdk|INFO|DPDK Disabled - to change this requires a restart./d']])
 ])
 
 # OVS_VSWITCHD_START([vsctl-args], [vsctl-output], [=override])
@@ -340,7 +340,8 @@ add_of_br () {
 			  other-config:datapath-id=$dpid \
 			  other-config:hwaddr=$mac \
 			  protocols="[[OpenFlow10,OpenFlow11,OpenFlow12,\
-                                       OpenFlow13,OpenFlow14,OpenFlow15]]" \
+                                       OpenFlow13,OpenFlow14,OpenFlow15,\
+                                       OpenFlow16]]" \
         -- "$@"
 }
 
@@ -382,8 +383,8 @@ m4_divert_pop([PREPARE_TESTS])
 #   OVS_VSWITCHD_STOP(["/expected error/d"])
 m4_define([OVS_VSWITCHD_STOP],
   [AT_CHECK([check_logs $1])
-   AT_CHECK([ovs-appctl -t ovs-vswitchd exit])
-   AT_CHECK([ovs-appctl -t ovsdb-server exit])])
+   OVS_APP_EXIT_AND_WAIT([ovs-vswitchd])
+   OVS_APP_EXIT_AND_WAIT([ovsdb-server])])
 
 m4_define([OVS_VSWITCHD_DISABLE_TUNNEL_PUSH_POP],
   [AT_CHECK([ovs-appctl ofproto/tnl-push-pop off], [0], [dnl
