@@ -2524,6 +2524,18 @@ ofctl_mod_group(struct ovs_cmdl_context *ctx)
 }
 
 static void
+ofctl_add_mod_group(struct ovs_cmdl_context *ctx)
+{
+    ofctl_group_mod(ctx->argc, ctx->argv, OFPGC11_ADD_OR_MOD);
+}
+
+static void
+ofctl_add_mod_groups(struct ovs_cmdl_context *ctx)
+{
+    ofctl_group_mod_file(ctx->argc, ctx->argv, OFPGC11_ADD_OR_MOD);
+}
+
+static void
 ofctl_del_groups(struct ovs_cmdl_context *ctx)
 {
     ofctl_group_mod(ctx->argc, ctx->argv, OFPGC11_DELETE);
@@ -4038,6 +4050,10 @@ static const struct ovs_cmdl_command all_commands[] = {
       1, 2, ofctl_add_groups },
     { "mod-group", "switch group",
       1, 2, ofctl_mod_group },
+    { "write-group", "switch group",
+      1, 2, ofctl_add_mod_group },
+    { "write-groups", "switch group",
+      1, 2, ofctl_add_mod_groups },
     { "del-groups", "switch [group]",
       1, 2, ofctl_del_groups },
     { "insert-buckets", "switch [group]",
