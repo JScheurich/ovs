@@ -416,6 +416,12 @@ Add each group entry to \fIswitch\fR's tables.
 Modify the action buckets in entries from \fIswitch\fR's tables for
 each group entry.
 .
+.IP "\fBwrite\-group \fIswitch group\fR"
+.IQ "\fBwrite\-group \fIswitch \fB\- < \fIfile\fR"
+.IQ "\fBwrite\-groups \fIswitch file\fR"
+Add each group entry to or modify existing group entries in \fIswitch\fR's
+tables.
+.
 .IP "\fBdel\-groups \fIswitch\fR"
 .IQ "\fBdel\-groups \fIswitch \fR[\fIgroup\fR]"
 .IQ "\fBdel\-groups \fIswitch \fB\- < \fIfile\fR"
