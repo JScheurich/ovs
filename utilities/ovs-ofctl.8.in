@@ -431,16 +431,10 @@ zero or more groups in the same syntax, one per line.
 .IQ "\fBadd\-groups \fIswitch file\fR"
 Add each group entry to \fIswitch\fR's tables.
 .
-.IP "\fBmod\-group \fIswitch group\fR"
-.IQ "\fBmod\-group \fIswitch \fB\- < \fIfile\fR"
+.IP "[\fB\-\-may\-create\fR] \fBmod\-group \fIswitch group\fR"
+.IQ "[\fB\-\-may\-create\fR] \fBmod\-group \fIswitch \fB\- < \fIfile\fR"
 Modify the action buckets in entries from \fIswitch\fR's tables for
-each group entry.
-.
-.IP "\fBwrite\-group \fIswitch group\fR"
-.IQ "\fBwrite\-group \fIswitch \fB\- < \fIfile\fR"
-.IQ "\fBwrite\-groups \fIswitch file\fR"
-Add each group entry to or modify existing group entries in \fIswitch\fR's
-tables.
+each group entry. Optionally create non-existing group entries.
 .
 .IP "\fBdel\-groups \fIswitch\fR"
 .IQ "\fBdel\-groups \fIswitch \fR[\fIgroup\fR]"
@@ -2950,7 +2944,13 @@ Bundles require OpenFlow 1.4 or higher.  An explicit \fB-O
 OpenFlow14\fR option is not needed, but you may need to enable
 OpenFlow 1.4 support for OVS by setting the OVSDB \fIprotocols\fR
 column in the \fIbridge\fR table.
+.
 .RE
+.
+.IP "\fB\-\-may\-create\fR"
+A mod-group command creates a group if it doesn't exist yet. This uses
+an Open vSwitch extension to OpenFlow and only works with Open vSwitch
+2.6 and later.
 .
 .so lib/ofp-version.man
 .

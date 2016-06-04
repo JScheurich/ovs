@@ -9247,11 +9247,8 @@ bad_group_cmd(enum ofp15_group_mod_command cmd)
         break;
 
     case OFPGC15_MODIFY:
-        cmd_str = "mod-group";
-        break;
-
     case OFPGC15_ADD_OR_MOD:
-        cmd_str = "write-group";
+        cmd_str = "mod-group";
         break;
 
     case OFPGC15_DELETE:
