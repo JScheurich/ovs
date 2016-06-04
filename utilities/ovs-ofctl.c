@@ -84,6 +84,10 @@ static bool enable_color;
  */
 static bool strict;
 
+/* --may-create: A mod-group command creates a group that does not yet exist.
+ */
+static bool may_create = false;
+
 /* --readd: If true, on replace-flows, re-add even flows that have not changed
  * (to reset flow counters). */
 static bool readd;
@@ -175,6 +179,7 @@ parse_options(int argc, char *argv[])
         OPT_UNIXCTL,
         OPT_BUNDLE,
         OPT_COLOR,
+        OPT_MAY_CREATE,
         DAEMON_OPTION_ENUMS,
         OFP_VERSION_OPTION_ENUMS,
         VLOG_OPTION_ENUMS
@@ -194,6 +199,7 @@ parse_options(int argc, char *argv[])
         {"option", no_argument, NULL, 'o'},
         {"bundle", no_argument, NULL, OPT_BUNDLE},
         {"color", optional_argument, NULL, OPT_COLOR},
+        {"may-create", no_argument, NULL, OPT_MAY_CREATE},
         DAEMON_LONG_OPTIONS,
         OFP_VERSION_LONG_OPTIONS,
         VLOG_LONG_OPTIONS,
@@ -319,6 +325,10 @@ parse_options(int argc, char *argv[])
             }
         break;
 
+        case OPT_MAY_CREATE:
+            may_create = true;
+            break;
+
         DAEMON_OPTION_HANDLERS
         OFP_VERSION_OPTION_HANDLERS
         VLOG_OPTION_HANDLERS
@@ -440,6 +450,7 @@ usage(void)
     vlog_usage();
     printf("\nOther options:\n"
            "  --strict                    use strict match for flow commands\n"
+           "  --may-create                mod-group creates a non-existing group\n"
            "  --readd                     replace flows that haven't changed\n"
            "  -F, --flow-format=FORMAT    force particular flow format\n"
            "  -P, --packet-in-format=FRMT force particular packet in format\n"
@@ -2520,19 +2531,8 @@ ofctl_add_groups(struct ovs_cmdl_context *ctx)
 static void
 ofctl_mod_group(struct ovs_cmdl_context *ctx)
 {
-    ofctl_group_mod(ctx->argc, ctx->argv, OFPGC11_MODIFY);
-}
-
-static void
-ofctl_add_mod_group(struct ovs_cmdl_context *ctx)
-{
-    ofctl_group_mod(ctx->argc, ctx->argv, OFPGC11_ADD_OR_MOD);
-}
-
-static void
-ofctl_add_mod_groups(struct ovs_cmdl_context *ctx)
-{
-    ofctl_group_mod_file(ctx->argc, ctx->argv, OFPGC11_ADD_OR_MOD);
+    ofctl_group_mod(ctx->argc, ctx->argv,
+                    may_create ? OFPGC11_ADD_OR_MOD : OFPGC11_MODIFY);
 }
 
 static void
@@ -4050,10 +4050,6 @@ static const struct ovs_cmdl_command all_commands[] = {
       1, 2, ofctl_add_groups },
     { "mod-group", "switch group",
       1, 2, ofctl_mod_group },
-    { "write-group", "switch group",
-      1, 2, ofctl_add_mod_group },
-    { "write-groups", "switch group",
-      1, 2, ofctl_add_mod_groups },
     { "del-groups", "switch [group]",
       1, 2, ofctl_del_groups },
     { "insert-buckets", "switch [group]",
