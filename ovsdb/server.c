@@ -19,6 +19,7 @@
 
 #include "hash.h"
 #include "ovsdb.h"
+#include "uuid.h"
 
 /* Initializes 'session' as a session within 'server'. */
 void
@@ -121,6 +122,7 @@ ovsdb_server_init(struct ovsdb_server *server)
 {
     shash_init(&server->dbs);
     hmap_init(&server->locks);
+    uuid_generate(&server->uuid);
 }
 
 /* Adds 'db' to the set of databases served out by 'server'.  Returns true if
@@ -129,20 +131,14 @@ ovsdb_server_init(struct ovsdb_server *server)
 bool
 ovsdb_server_add_db(struct ovsdb_server *server, struct ovsdb *db)
 {
-    return shash_add_once(&server->dbs, db->schema->name, db);
+    return shash_add_once(&server->dbs, db->name, db);
 }
 
-/* Removes 'db' from the set of databases served out by 'server'.  Returns
- * true if successful, false if there is no db associated with
- * db->schema->name. */
-bool
+/* Removes 'db' from the set of databases served out by 'server'. */
+void
 ovsdb_server_remove_db(struct ovsdb_server *server, struct ovsdb *db)
 {
-    void *data = shash_find_and_delete(&server->dbs, db->schema->name);
-    if (data) {
-        return true;
-    }
-    return false;
+    shash_find_and_delete_assert(&server->dbs, db->name);
 }
 
 /* Destroys 'server'. */

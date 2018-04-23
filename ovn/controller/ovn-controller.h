@@ -31,34 +31,47 @@ struct controller_ctx {
     struct ovsdb_idl_txn *ovs_idl_txn;
 };
 
-/* Contains hmap_node whose hash values are the tunnel_key of datapaths
- * with at least one local port binding. It also stores the port binding of
- * "localnet" port if such a port exists on the datapath, which indicates
- * physical network should be used for inter-chassis communication through
- * the localnet port */
+/* States to move through when a new conntrack zone has been allocated. */
+enum ct_zone_pending_state {
+    CT_ZONE_OF_QUEUED,    /* Waiting to send conntrack flush command. */
+    CT_ZONE_OF_SENT,      /* Sent and waiting for confirmation on flush. */
+    CT_ZONE_DB_QUEUED,    /* Waiting for DB transaction to open. */
+    CT_ZONE_DB_SENT,      /* Sent and waiting for confirmation from DB. */
+};
+
+struct ct_zone_pending_entry {
+    int zone;
+    bool add;             /* Is the entry being added? */
+    ovs_be32 of_xid;      /* Transaction id for barrier. */
+    enum ct_zone_pending_state state;
+};
+
+/* A logical datapath that has some relevance to this hypervisor.  A logical
+ * datapath D is relevant to hypervisor H if:
+ *
+ *     - Some VIF or l2gateway or l3gateway port in D is located on H.
+ *
+ *     - D is reachable over a series of hops across patch ports, starting from
+ *       a datapath relevant to H.
+ *
+ * The 'hmap_node''s hash value is 'datapath->tunnel_key'. */
 struct local_datapath {
     struct hmap_node hmap_node;
-    struct hmap_node uuid_hmap_node;
-    struct uuid uuid;
-    char *logical_port;
+    const struct sbrec_datapath_binding *datapath;
+    const struct ldatapath *ldatapath;
+
+    /* The localnet port in this datapath, if any (at most one is allowed). */
     const struct sbrec_port_binding *localnet_port;
+
+    /* True if this datapath contains an l3gateway port located on this
+     * hypervisor. */
+    bool has_local_l3gateway;
+    const struct sbrec_datapath_binding **peer_dps;
+    size_t n_peer_dps;
 };
 
 struct local_datapath *get_local_datapath(const struct hmap *,
                                           uint32_t tunnel_key);
-
-/* Contains hmap_node whose hash values are the tunnel_key of datapaths
- * with at least one logical patch port binding. */
-struct patched_datapath {
-    struct hmap_node hmap_node;
-    char *key;  /* Holds the uuid of the corresponding datapath. */
-    bool local; /* 'True' if the datapath is for gateway router. */
-    bool stale; /* 'True' if the datapath is not referenced by any patch
-                 * port. */
-};
-
-struct patched_datapath *get_patched_datapath(const struct hmap *,
-                                              uint32_t tunnel_key);
 
 const struct ovsrec_bridge *get_bridge(struct ovsdb_idl *,
                                        const char *br_name);

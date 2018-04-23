@@ -15,9 +15,6 @@
 
 #include <config.h>
 #include "encaps.h"
-#include "binding.h"
-#include "lflow.h"
-#include "lport.h"
 
 #include "lib/hash.h"
 #include "lib/sset.h"
@@ -46,15 +43,8 @@ encaps_register_ovs_idl(struct ovsdb_idl *ovs_idl)
 
 /* Enough context to create a new tunnel, using tunnel_add(). */
 struct tunnel_ctx {
-    /* Contains "struct port_hash_node"s.  Used to figure out what
-     * existing tunnels should be deleted: we index all of the OVN encap
-     * rows into this data structure, then as existing rows are
-     * generated we remove them.  After generating all the rows, any
-     * remaining in 'tunnel_hmap' must be deleted from the database. */
-    struct hmap tunnel_hmap;
-
-    /* Only valid within the process_full_encaps case in encaps_run(). */
-    struct hmap tunnel_hmap_by_uuid;
+    /* Maps from a chassis name to "struct chassis_node *". */
+    struct shash chassis;
 
     /* Names of all ports in the bridge, to allow checking uniqueness when
      * adding a new tunnel. */
@@ -64,55 +54,13 @@ struct tunnel_ctx {
     const struct ovsrec_bridge *br_int;
 };
 
-static struct tunnel_ctx tc = {
-    .tunnel_hmap = HMAP_INITIALIZER(&tc.tunnel_hmap),
-    .tunnel_hmap_by_uuid = HMAP_INITIALIZER(&tc.tunnel_hmap_by_uuid),
-    .port_names = SSET_INITIALIZER(&tc.port_names),
-};
-
-static bool process_full_encaps = false;
-
-struct port_hash_node {
-    struct hmap_node node;
-    struct hmap_node uuid_node;
-    struct uuid uuid;
+struct chassis_node {
     const struct ovsrec_port *port;
     const struct ovsrec_bridge *bridge;
 };
 
-static size_t
-port_hash(const char *chassis_id, const char *type, const char *ip)
-{
-    size_t hash = hash_string(chassis_id, 0);
-    hash = hash_string(type, hash);
-    return hash_string(ip, hash);
-}
-
-static size_t
-port_hash_rec(const struct ovsrec_port *port)
-{
-    const char *chassis_id, *ip;
-    const struct ovsrec_interface *iface;
-
-    chassis_id = smap_get(&port->external_ids, "ovn-chassis-id");
-
-    if (!chassis_id || !port->n_interfaces) {
-        /* This should not happen for an OVN-created port. */
-        return 0;
-    }
-
-    iface = port->interfaces[0];
-    ip = smap_get(&iface->options, "remote_ip");
-    if (!ip) {
-        /* This should not happen for an OVN-created port. */
-        return 0;
-    }
-
-    return port_hash(chassis_id, iface->type, ip);
-}
-
 static char *
-tunnel_create_name(const char *chassis_id)
+tunnel_create_name(struct tunnel_ctx *tc, const char *chassis_id)
 {
     int i;
 
@@ -120,7 +68,7 @@ tunnel_create_name(const char *chassis_id)
         char *port_name;
         port_name = xasprintf("ovn-%.6s-%x", chassis_id, i);
 
-        if (!sset_contains(&tc.port_names, port_name)) {
+        if (!sset_contains(&tc->port_names, port_name)) {
             return port_name;
         }
 
@@ -130,140 +78,61 @@ tunnel_create_name(const char *chassis_id)
     return NULL;
 }
 
-static struct port_hash_node *
-port_lookup_by_uuid(struct hmap *hmap_p, const struct uuid *uuid)
-{
-    struct port_hash_node *answer;
-    HMAP_FOR_EACH_WITH_HASH (answer, uuid_node, uuid_hash(uuid),
-                             hmap_p) {
-        if (uuid_equals(uuid, &answer->uuid)) {
-            return answer;
-        }
-    }
-    return NULL;
-}
-
-static struct port_hash_node *
-port_lookup_by_port(const struct ovsrec_port *port)
-{
-    struct port_hash_node *answer;
-    HMAP_FOR_EACH_WITH_HASH (answer, node, port_hash_rec(port),
-                             &tc.tunnel_hmap) {
-        if (port == answer->port) {
-            return answer;
-        }
-    }
-    return NULL;
-}
-
 static void
-tunnel_add(const struct sbrec_chassis *chassis_rec,
+tunnel_add(struct tunnel_ctx *tc, const char *new_chassis_id,
            const struct sbrec_encap *encap)
 {
-    struct port_hash_node *hash_node;
-    const char *new_chassis_id = chassis_rec->name;
-
-    /* Check whether such a row already exists in OVS. If so, update
-     * the uuid field and insert into the by uuid hashmap. If not,
-     * create the tunnel. */
-
-    HMAP_FOR_EACH_WITH_HASH (hash_node, node,
-                             port_hash(new_chassis_id,
-                                       encap->type, encap->ip),
-                             &tc.tunnel_hmap) {
-        const struct ovsrec_port *port = hash_node->port;
-        const char *chassis_id = smap_get(&port->external_ids,
-                                          "ovn-chassis-id");
-        const struct ovsrec_interface *iface;
-        const char *ip;
-
-        if (!chassis_id || !port->n_interfaces) {
-            continue;
-        }
-
-        iface = port->interfaces[0];
-        ip = smap_get(&iface->options, "remote_ip");
-        if (!ip) {
-            continue;
-        }
-
-        if (!strcmp(new_chassis_id, chassis_id)
-            && !strcmp(encap->type, iface->type)
-            && !strcmp(encap->ip, ip)) {
-
-            memcpy(&hash_node->uuid, &chassis_rec->header_.uuid,
-                   sizeof hash_node->uuid);
-            if (!port_lookup_by_uuid(&tc.tunnel_hmap_by_uuid,
-                                     &hash_node->uuid)) {
-                hmap_insert(&tc.tunnel_hmap_by_uuid, &hash_node->uuid_node,
-                            uuid_hash(&hash_node->uuid));
-            }
-            return;
-        }
+    struct smap options = SMAP_INITIALIZER(&options);
+    smap_add(&options, "remote_ip", encap->ip);
+    smap_add(&options, "key", "flow");
+    const char *csum = smap_get(&encap->options, "csum");
+    if (csum && (!strcmp(csum, "true") || !strcmp(csum, "false"))) {
+        smap_add(&options, "csum", csum);
     }
 
-    /* No such port, so add one. */
-    struct smap options = SMAP_INITIALIZER(&options);
-    struct ovsrec_port *port, **ports;
-    struct ovsrec_interface *iface;
-    char *port_name;
-    size_t i;
+    /* If there's an existing chassis record that does not need any change,
+     * keep it.  Otherwise, create a new record (if there was an existing
+     * record, the new record will supplant it and encaps_run() will delete
+     * it). */
+    struct chassis_node *chassis = shash_find_data(&tc->chassis,
+                                                   new_chassis_id);
+    if (chassis
+        && chassis->port->n_interfaces == 1
+        && !strcmp(chassis->port->interfaces[0]->type, encap->type)
+        && smap_equal(&chassis->port->interfaces[0]->options, &options)) {
+        shash_find_and_delete(&tc->chassis, new_chassis_id);
+        free(chassis);
+        goto exit;
+    }
 
-    port_name = tunnel_create_name(new_chassis_id);
+    /* Choose a name for the new port.  If we're replacing an old port, reuse
+     * its name, otherwise generate a new, unique name. */
+    char *port_name = (chassis
+                       ? xstrdup(chassis->port->name)
+                       : tunnel_create_name(tc, new_chassis_id));
     if (!port_name) {
         VLOG_WARN("Unable to allocate unique name for '%s' tunnel",
                   new_chassis_id);
-        return;
+        goto exit;
     }
 
-    iface = ovsrec_interface_insert(tc.ovs_txn);
+    struct ovsrec_interface *iface = ovsrec_interface_insert(tc->ovs_txn);
     ovsrec_interface_set_name(iface, port_name);
     ovsrec_interface_set_type(iface, encap->type);
-    smap_add(&options, "remote_ip", encap->ip);
-    smap_add(&options, "key", "flow");
     ovsrec_interface_set_options(iface, &options);
-    smap_destroy(&options);
 
-    port = ovsrec_port_insert(tc.ovs_txn);
+    struct ovsrec_port *port = ovsrec_port_insert(tc->ovs_txn);
     ovsrec_port_set_name(port, port_name);
     ovsrec_port_set_interfaces(port, &iface, 1);
     const struct smap id = SMAP_CONST1(&id, "ovn-chassis-id", new_chassis_id);
     ovsrec_port_set_external_ids(port, &id);
 
-    ports = xmalloc(sizeof *tc.br_int->ports * (tc.br_int->n_ports + 1));
-    for (i = 0; i < tc.br_int->n_ports; i++) {
-        ports[i] = tc.br_int->ports[i];
-    }
-    ports[tc.br_int->n_ports] = port;
-    ovsrec_bridge_verify_ports(tc.br_int);
-    ovsrec_bridge_set_ports(tc.br_int, ports, tc.br_int->n_ports + 1);
+    ovsrec_bridge_update_ports_addvalue(tc->br_int, port);
 
-    sset_add(&tc.port_names, port_name);
-    free(port_name);
-    free(ports);
-    binding_reset_processing();
-    lport_index_reset();
-    mcgroup_index_reset();
-    lflow_reset_processing();
-    process_full_encaps = true;
-}
+    sset_add_and_free(&tc->port_names, port_name);
 
-static void
-bridge_delete_port(const struct ovsrec_bridge *br,
-                   const struct ovsrec_port *port)
-{
-    struct ovsrec_port **ports;
-    size_t i, n;
-
-    ports = xmalloc(sizeof *br->ports * br->n_ports);
-    for (i = n = 0; i < br->n_ports; i++) {
-        if (br->ports[i] != port) {
-            ports[n++] = br->ports[i];
-        }
-    }
-    ovsrec_bridge_verify_ports(br);
-    ovsrec_bridge_set_ports(br, ports, n);
-    free(ports);
+exit:
+    smap_destroy(&options);
 }
 
 static struct sbrec_encap *
@@ -283,64 +152,6 @@ preferred_encap(const struct sbrec_chassis *chassis_rec)
     return best_encap;
 }
 
-static bool
-check_and_add_tunnel(const struct sbrec_chassis *chassis_rec,
-                     const char *chassis_id)
-{
-    if (strcmp(chassis_rec->name, chassis_id)) {
-        const struct sbrec_encap *encap = preferred_encap(chassis_rec);
-        if (!encap) {
-            VLOG_INFO("No supported encaps for '%s'", chassis_rec->name);
-            return false;
-        }
-        tunnel_add(chassis_rec, encap);
-        return true;
-    }
-    return false;
-}
-
-static void
-check_and_update_tunnel(const struct sbrec_chassis *chassis_rec)
-{
-    struct port_hash_node *port_node;
-    port_node = port_lookup_by_uuid(&tc.tunnel_hmap_by_uuid,
-                                    &chassis_rec->header_.uuid);
-    if (port_node) {
-        const struct sbrec_encap *encap = preferred_encap(chassis_rec);
-        const struct ovsrec_port *port = port_node->port;
-        const struct ovsrec_interface *iface = port->interfaces[0];
-        char *port_name = tunnel_create_name(chassis_rec->name);
-        if (!port_name) {
-            VLOG_WARN("Unable to allocate unique name for '%s' tunnel",
-                      chassis_rec->name);
-            return;
-        }
-        if (strcmp(encap->type, iface->type)) {
-            ovsrec_interface_set_type(iface, encap->type);
-        }
-        const char *ip = smap_get(&iface->options, "remote_ip");
-        if (!ip || strcmp(encap->ip, ip)) {
-            struct smap options = SMAP_INITIALIZER(&options);
-            smap_add(&options, "remote_ip", encap->ip);
-            smap_add(&options, "key", "flow");
-            ovsrec_interface_set_options(iface, &options);
-            smap_destroy(&options);
-        }
-
-        const char *chassis = smap_get(&port->external_ids, "ovn-chassis-id");
-        if (!chassis || strcmp(chassis_rec->name, chassis)) {
-            const struct smap id = SMAP_CONST1(&id, "ovn-chassis-id",
-                                               chassis_rec->name);
-            ovsrec_port_set_external_ids(port, &id);
-        }
-    } else {
-        /* This tunnel has been lost and shouldn't have been, so
-         * warn the operator of that fact. */
-        VLOG_WARN("Unable to find tunnel for chassis '%s'",
-                  chassis_rec->name);
-    }
-}
-
 void
 encaps_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
            const char *chassis_id)
@@ -352,7 +163,12 @@ encaps_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
     const struct sbrec_chassis *chassis_rec;
     const struct ovsrec_bridge *br;
 
-    tc.br_int = br_int;
+    struct tunnel_ctx tc = {
+        .chassis = SHASH_INITIALIZER(&tc.chassis),
+        .port_names = SSET_INITIALIZER(&tc.port_names),
+        .br_int = br_int
+    };
+
     tc.ovs_txn = ctx->ovs_idl_txn;
     ovsdb_idl_txn_add_comment(tc.ovs_txn,
                               "ovn-controller: modifying OVS tunnels '%s'",
@@ -362,83 +178,48 @@ encaps_run(struct controller_ctx *ctx, const struct ovsrec_bridge *br_int,
      *
      * Collect all the OVN-created tunnels into tc.tunnel_hmap. */
     OVSREC_BRIDGE_FOR_EACH(br, ctx->ovs_idl) {
-        size_t i;
-
-        for (i = 0; i < br->n_ports; i++) {
+        for (size_t i = 0; i < br->n_ports; i++) {
             const struct ovsrec_port *port = br->ports[i];
-
             sset_add(&tc.port_names, port->name);
 
-            const char *chassis_id = smap_get(&port->external_ids,
-                                              "ovn-chassis-id");
-            if (chassis_id && !port_lookup_by_port(port)) {
-                struct port_hash_node *hash_node =
-                    xzalloc(sizeof *hash_node);
-                hash_node->bridge = br;
-                hash_node->port = port;
-                hmap_insert(&tc.tunnel_hmap, &hash_node->node,
-                            port_hash_rec(port));
-                process_full_encaps = true;
-            }
-        }
-    }
-
-    if (process_full_encaps) {
-        /* Create tunnels to the other chassis. */
-        struct hmap keep_tunnel_hmap_by_uuid =
-            HMAP_INITIALIZER(&keep_tunnel_hmap_by_uuid);
-        SBREC_CHASSIS_FOR_EACH (chassis_rec, ctx->ovnsb_idl) {
-            check_and_add_tunnel(chassis_rec, chassis_id);
-            struct port_hash_node *hash_node = xzalloc(sizeof *hash_node);
-            memcpy(&hash_node->uuid, &chassis_rec->header_.uuid,
-                   sizeof hash_node->uuid);
-            hmap_insert(&keep_tunnel_hmap_by_uuid, &hash_node->uuid_node,
-                        uuid_hash(&hash_node->uuid));
-        }
-
-        /* Delete any tunnels that weren't recreated above. */
-        struct port_hash_node *old_hash_node, *next_hash_node;
-        HMAP_FOR_EACH_SAFE (old_hash_node, next_hash_node,
-                            node, &tc.tunnel_hmap) {
-            if (!uuid_is_zero(&old_hash_node->uuid)
-                && !port_lookup_by_uuid(&keep_tunnel_hmap_by_uuid,
-                                        &old_hash_node->uuid)) {
-                bridge_delete_port(old_hash_node->bridge, old_hash_node->port);
-                sset_find_and_delete(&tc.port_names,
-                                     old_hash_node->port->name);
-                hmap_remove(&tc.tunnel_hmap, &old_hash_node->node);
-                hmap_remove(&tc.tunnel_hmap_by_uuid,
-                            &old_hash_node->uuid_node);
-                free(old_hash_node);
-            }
-        }
-        hmap_destroy(&keep_tunnel_hmap_by_uuid);
-        process_full_encaps = false;
-    } else {
-        SBREC_CHASSIS_FOR_EACH_TRACKED (chassis_rec, ctx->ovnsb_idl) {
-            if (sbrec_chassis_is_deleted(chassis_rec)) {
-                /* Lookup the tunnel by row uuid and remove it. */
-                struct port_hash_node *port_hash =
-                    port_lookup_by_uuid(&tc.tunnel_hmap_by_uuid,
-                                        &chassis_rec->header_.uuid);
-                if (port_hash) {
-                    bridge_delete_port(port_hash->bridge, port_hash->port);
-                    sset_find_and_delete(&tc.port_names,
-                                         port_hash->port->name);
-                    hmap_remove(&tc.tunnel_hmap, &port_hash->node);
-                    hmap_remove(&tc.tunnel_hmap_by_uuid,
-                                &port_hash->uuid_node);
-                    free(port_hash);
-                    binding_reset_processing();
-                    lflow_reset_processing();
+            const char *id = smap_get(&port->external_ids, "ovn-chassis-id");
+            if (id) {
+                if (!shash_find(&tc.chassis, id)) {
+                    struct chassis_node *chassis = xzalloc(sizeof *chassis);
+                    chassis->bridge = br;
+                    chassis->port = port;
+                    shash_add_assert(&tc.chassis, id, chassis);
+                } else {
+                    /* Duplicate port for ovn-chassis-id.  Arbitrarily choose
+                     * to delete this one. */
+                    ovsrec_bridge_update_ports_delvalue(br, port);
                 }
-            } else if (sbrec_chassis_is_new(chassis_rec)) {
-                check_and_add_tunnel(chassis_rec, chassis_id);
-            } else {
-                check_and_update_tunnel(chassis_rec);
             }
         }
     }
+
+    SBREC_CHASSIS_FOR_EACH(chassis_rec, ctx->ovnsb_idl) {
+        if (strcmp(chassis_rec->name, chassis_id)) {
+            /* Create tunnels to the other chassis. */
+            const struct sbrec_encap *encap = preferred_encap(chassis_rec);
+            if (!encap) {
+                VLOG_INFO("No supported encaps for '%s'", chassis_rec->name);
+                continue;
+            }
+            tunnel_add(&tc, chassis_rec->name, encap);
+        }
+    }
+
+    /* Delete any existing OVN tunnels that were not still around. */
+    struct shash_node *node, *next_node;
+    SHASH_FOR_EACH_SAFE (node, next_node, &tc.chassis) {
+        struct chassis_node *chassis = node->data;
+        ovsrec_bridge_update_ports_delvalue(chassis->bridge, chassis->port);
+        shash_delete(&tc.chassis, node);
+        free(chassis);
+    }
+    shash_destroy(&tc.chassis);
+    sset_destroy(&tc.port_names);
 }
 
 /* Returns true if the database is all cleaned up, false if more work is

@@ -1,4 +1,4 @@
-# Copyright (c) 2009, 2010, 2011, 2012, 2013 Nicira, Inc.
+# Copyright (c) 2009, 2010, 2011, 2012, 2013, 2016 Nicira, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,12 +15,12 @@
 import sys
 import uuid
 
-import six
-
-from ovs.db import error
-import ovs.db.parser
 import ovs.db.data
+import ovs.db.parser
 import ovs.ovsuuid
+from ovs.db import error
+
+import six
 
 
 class AtomicType(object):
@@ -55,6 +55,7 @@ class AtomicType(object):
 
     def default_atom(self):
         return ovs.db.data.Atom(self, self.default)
+
 
 REAL_PYTHON_TYPES = list(six.integer_types)
 REAL_PYTHON_TYPES.extend([float])
@@ -295,6 +296,7 @@ class BaseType(object):
         if self.enum:
             literals = [value.toEnglish(escapeLiteral)
                         for value in self.enum.values]
+            literals.sort()
             if len(literals) == 1:
                 english = 'must be %s' % (literals[0])
             elif len(literals) == 2:
@@ -339,8 +341,11 @@ class BaseType(object):
 
         return english
 
-    def toCType(self, prefix):
+    def toCType(self, prefix, refTable=True):
         if self.ref_table_name:
+            if not refTable:
+                assert self.type == UuidType
+                return 'struct uuid *'
             return "struct %s%s *" % (prefix, self.ref_table_name.lower())
         else:
             return {IntegerType: 'int64_t ',
@@ -349,21 +354,37 @@ class BaseType(object):
                     BooleanType: 'bool ',
                     StringType: 'char *'}[self.type]
 
+    def to_const_c_type(self, prefix, refTable=True):
+        nonconst = self.toCType(prefix, refTable)
+
+        # A "const" prefix works OK for the types we use, but it's a little
+        # weird to write "const bool" as, e.g., a function parameter since
+        # there's no real "const"ness there.  So, omit the "const" except
+        # when a pointer is involved.
+        if '*' in nonconst:
+            return 'const ' + nonconst
+        else:
+            return nonconst
+
     def toAtomicType(self):
         return "OVSDB_TYPE_%s" % self.type.to_string().upper()
 
-    def copyCValue(self, dst, src):
+    def copyCValue(self, dst, src, refTable=True):
         args = {'dst': dst, 'src': src}
         if self.ref_table_name:
+            if not refTable:
+                return "%(dst)s = *%(src)s;" % args
             return ("%(dst)s = %(src)s->header_.uuid;") % args
         elif self.type == StringType:
             return "%(dst)s = xstrdup(%(src)s);" % args
         else:
             return "%(dst)s = %(src)s;" % args
 
-    def assign_c_value_casting_away_const(self, dst, src):
+    def assign_c_value_casting_away_const(self, dst, src, refTable=True):
         args = {'dst': dst, 'src': src}
         if self.ref_table_name:
+            if not refTable:
+                return "%(dst)s = *%(src)s;" % args
             return ("%(dst)s = %(src)s->header_.uuid;") % args
         elif self.type == StringType:
             return "%(dst)s = CONST_CAST(char *, %(src)s);" % args
@@ -383,40 +404,50 @@ class BaseType(object):
                        StringType: '%s = NULL;'}[self.type]
             return pattern % var
 
-    def cInitBaseType(self, indent, var):
-        stmts = []
-        stmts.append('ovsdb_base_type_init(&%s, %s);' % (
-                var, self.toAtomicType()))
+    def cInitBaseType(self, prefix, prereqs):
+        init = [".type = %s," % self.toAtomicType()]
         if self.enum:
-            stmts.append("%s.enum_ = xmalloc(sizeof *%s.enum_);"
-                         % (var, var))
-            stmts += self.enum.cInitDatum("%s.enum_" % var)
+            datum_name = "%s_enum" % prefix
+            init += [".enum_ = &%s," % datum_name]
+            prereqs += self.enum.cDeclareDatum(datum_name)
         if self.type == IntegerType:
-            if self.min is not None:
-                stmts.append('%s.u.integer.min = INT64_C(%d);'
-                        % (var, self.min))
-            if self.max is not None:
-                stmts.append('%s.u.integer.max = INT64_C(%d);'
-                        % (var, self.max))
+            if self.min is None:
+                low = "INT64_MIN"
+            else:
+                low = "INT64_C(%d)" % self.min
+            if self.max is None:
+                high = "INT64_MAX"
+            else:
+                high = "INT64_C(%d)" % self.max
+            init.append(".u.integer = { .min = %s, .max = %s }," % (low, high))
         elif self.type == RealType:
-            if self.min is not None:
-                stmts.append('%s.u.real.min = %d;' % (var, self.min))
-            if self.max is not None:
-                stmts.append('%s.u.real.max = %d;' % (var, self.max))
+            if self.min is None:
+                low = "-DBL_MAX"
+            else:
+                low = self.min
+            if self.max is None:
+                high = "DBL_MAX"
+            else:
+                high = self.max
+            init.append(".u.real = { .min = %s, .max = %s }," % (low, high))
         elif self.type == StringType:
-            if self.min_length is not None:
-                stmts.append('%s.u.string.minLen = %d;'
-                        % (var, self.min_length))
-            if self.max_length != sys.maxsize:
-                stmts.append('%s.u.string.maxLen = %d;'
-                        % (var, self.max_length))
+            if self.min is None:
+                low = 0
+            else:
+                low = self.min_length
+            if self.max is None:
+                high = "UINT_MAX"
+            else:
+                high = self.max_length
+            init.append(".u.string = { .minLen = %s, .maxLen = %s }," % (
+                low, high))
         elif self.type == UuidType:
             if self.ref_table_name is not None:
-                stmts.append('%s.u.uuid.refTableName = "%s";'
-                        % (var, escapeCString(self.ref_table_name)))
-                stmts.append('%s.u.uuid.refType = OVSDB_REF_%s;'
-                        % (var, self.ref_type.upper()))
-        return '\n'.join([indent + stmt for stmt in stmts])
+                init.append(".u.uuid = { .refTableName = \"%s\", "
+                            ".refType = OVSDB_REF_%s }," % (
+                                escapeCString(self.ref_table_name),
+                                self.ref_type.upper()))
+        return init
 
 
 class Type(object):
@@ -594,17 +625,23 @@ class Type(object):
         else:
             return ""
 
-    def cInitType(self, indent, var):
-        initKey = self.key.cInitBaseType(indent, "%s.key" % var)
+    def cInitType(self, prefix, prereqs):
+        init = [".key = {"]
+        init += ["   " + x for x in self.key.cInitBaseType(prefix + "_key",
+                                                           prereqs)]
+        init += ["},"]
         if self.value:
-            initValue = self.value.cInitBaseType(indent, "%s.value" % var)
+            init += [".value = {"]
+            init += ["    " + x
+                     for x in self.value.cInitBaseType(prefix + "_value",
+                                                       prereqs)]
+            init += ["},"]
         else:
-            initValue = ('%sovsdb_base_type_init(&%s.value, '
-                         'OVSDB_TYPE_VOID);' % (indent, var))
-        initMin = "%s%s.n_min = %s;" % (indent, var, self.n_min)
+            init.append(".value = OVSDB_BASE_VOID_INIT,")
+        init.append(".n_min = %s," % self.n_min)
         if self.n_max == sys.maxsize:
             n_max = "UINT_MAX"
         else:
             n_max = self.n_max
-        initMax = "%s%s.n_max = %s;" % (indent, var, n_max)
-        return "\n".join((initKey, initValue, initMin, initMax))
+        init.append(".n_max = %s," % n_max)
+        return init

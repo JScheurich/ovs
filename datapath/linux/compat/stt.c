@@ -81,8 +81,13 @@ struct stt_dev {
 #define STT_PROTO_TCP		BIT(3)
 #define STT_PROTO_TYPES		(STT_PROTO_IPV4 | STT_PROTO_TCP)
 
+#ifdef HAVE_SKB_GSO_UDP
 #define SUPPORTED_GSO_TYPES (SKB_GSO_TCPV4 | SKB_GSO_UDP | SKB_GSO_DODGY | \
 			     SKB_GSO_TCPV6)
+#else
+#define SUPPORTED_GSO_TYPES (SKB_GSO_TCPV4 | SKB_GSO_DODGY | \
+			     SKB_GSO_TCPV6)
+#endif
 
 /* The length and offset of a fragment are encoded in the sequence number.
  * STT_SEQ_LEN_SHIFT is the left shift needed to store the length.
@@ -1310,7 +1315,7 @@ static bool validate_checksum(struct sk_buff *skb)
 static bool set_offloads(struct sk_buff *skb)
 {
 	struct stthdr *stth = stt_hdr(skb);
-	unsigned short gso_type;
+	unsigned int gso_type = 0;
 	int l3_header_size;
 	int l4_header_size;
 	u16 csum_offset;
@@ -1351,7 +1356,9 @@ static bool set_offloads(struct sk_buff *skb)
 	case STT_PROTO_IPV4:
 		/* UDP/IPv4 */
 		csum_offset = offsetof(struct udphdr, check);
+#ifdef HAVE_SKB_GSO_UDP
 		gso_type = SKB_GSO_UDP;
+#endif
 		l3_header_size = sizeof(struct iphdr);
 		l4_header_size = sizeof(struct udphdr);
 		skb->protocol = htons(ETH_P_IP);
@@ -1359,7 +1366,9 @@ static bool set_offloads(struct sk_buff *skb)
 	default:
 		/* UDP/IPv6 */
 		csum_offset = offsetof(struct udphdr, check);
+#ifdef HAVE_SKB_GSO_UDP
 		gso_type = SKB_GSO_UDP;
+#endif
 		l3_header_size = sizeof(struct ipv6hdr);
 		l4_header_size = sizeof(struct udphdr);
 		skb->protocol = htons(ETH_P_IPV6);
@@ -1882,7 +1891,11 @@ static void stt_setup(struct net_device *dev)
 
 	dev->netdev_ops = &stt_netdev_ops;
 	dev->ethtool_ops = &stt_ethtool_ops;
+#ifndef HAVE_NEEDS_FREE_NETDEV
 	dev->destructor = free_netdev;
+#else
+	dev->needs_free_netdev = true;
+#endif
 
 	SET_NETDEV_DEVTYPE(dev, &stt_type);
 
@@ -1905,7 +1918,12 @@ static const struct nla_policy stt_policy[IFLA_STT_MAX + 1] = {
 	[IFLA_STT_PORT]              = { .type = NLA_U16 },
 };
 
+#ifdef HAVE_EXT_ACK_IN_RTNL_LINKOPS
+static int stt_validate(struct nlattr *tb[], struct nlattr *data[],
+			struct netlink_ext_ack __always_unused *extack)
+#else
 static int stt_validate(struct nlattr *tb[], struct nlattr *data[])
+#endif
 {
 	if (tb[IFLA_ADDRESS]) {
 		if (nla_len(tb[IFLA_ADDRESS]) != ETH_ALEN)
@@ -1957,8 +1975,14 @@ static int stt_configure(struct net *net, struct net_device *dev,
 	return 0;
 }
 
+#ifdef HAVE_EXT_ACK_IN_RTNL_LINKOPS
+static int stt_newlink(struct net *net, struct net_device *dev,
+		struct nlattr *tb[], struct nlattr *data[],
+		struct netlink_ext_ack __always_unused *extack)
+#else
 static int stt_newlink(struct net *net, struct net_device *dev,
 		struct nlattr *tb[], struct nlattr *data[])
+#endif
 {
 	__be16 dst_port = htons(STT_DST_PORT);
 
@@ -2095,12 +2119,15 @@ int stt_init_module(void)
 	if (rc)
 		goto out2;
 
+#ifdef HAVE_LIST_IN_NF_HOOK_OPS
 	INIT_LIST_HEAD(&nf_hook_ops.list);
+#endif
 	pr_info("STT tunneling driver\n");
 	return 0;
 out2:
 	unregister_pernet_subsys(&stt_net_ops);
 out1:
+	pr_err("Error while initializing STT %d\n", rc);
 	return rc;
 }
 

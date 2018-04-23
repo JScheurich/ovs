@@ -1,4 +1,4 @@
-/* Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015 Nicira, Inc.
+/* Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -37,7 +37,9 @@
 #include "netdev.h"
 #include "openflow/openflow.h"
 #include "ovsdb-idl.h"
-#include "poll-loop.h"
+#include "ovs-rcu.h"
+#include "ovs-router.h"
+#include "openvswitch/poll-loop.h"
 #include "simap.h"
 #include "stream-ssl.h"
 #include "stream.h"
@@ -60,13 +62,19 @@ static unixctl_cb_func ovs_vswitchd_exit;
 static char *parse_options(int argc, char *argv[], char **unixctl_path);
 OVS_NO_RETURN static void usage(void);
 
+struct ovs_vswitchd_exit_args {
+    bool *exiting;
+    bool *cleanup;
+};
+
 int
 main(int argc, char *argv[])
 {
     char *unixctl_path = NULL;
     struct unixctl_server *unixctl;
     char *remote;
-    bool exiting;
+    bool exiting, cleanup;
+    struct ovs_vswitchd_exit_args exit_args = {&exiting, &cleanup};
     int retval;
 
     set_program_name(argv[0]);
@@ -75,7 +83,6 @@ main(int argc, char *argv[])
     service_start(&argc, &argv);
     remote = parse_options(argc, argv, &unixctl_path);
     fatal_ignore_sigpipe();
-    ovsrec_init();
 
     daemonize_start(true);
 
@@ -93,12 +100,14 @@ main(int argc, char *argv[])
     if (retval) {
         exit(EXIT_FAILURE);
     }
-    unixctl_command_register("exit", "", 0, 0, ovs_vswitchd_exit, &exiting);
+    unixctl_command_register("exit", "[--cleanup]", 0, 1,
+                             ovs_vswitchd_exit, &exit_args);
 
     bridge_init(remote);
     free(remote);
 
     exiting = false;
+    cleanup = false;
     while (!exiting) {
         memory_run();
         if (memory_should_report()) {
@@ -125,9 +134,11 @@ main(int argc, char *argv[])
             exiting = true;
         }
     }
-    bridge_exit();
+    bridge_exit(cleanup);
     unixctl_server_destroy(unixctl);
     service_stop();
+    vlog_disable_async();
+    ovsrcu_exit();
 
     return 0;
 }
@@ -145,6 +156,7 @@ parse_options(int argc, char *argv[], char **unixctl_pathp)
         OPT_DISABLE_SYSTEM,
         DAEMON_OPTION_ENUMS,
         OPT_DPDK,
+        SSL_OPTION_ENUMS,
         OPT_DUMMY_NUMA,
     };
     static const struct option long_options[] = {
@@ -179,6 +191,7 @@ parse_options(int argc, char *argv[], char **unixctl_pathp)
 
         case 'V':
             ovs_print_version(0, 0);
+            print_dpdk_version();
             exit(EXIT_SUCCESS);
 
         case OPT_MLOCKALL:
@@ -207,6 +220,7 @@ parse_options(int argc, char *argv[], char **unixctl_pathp)
 
         case OPT_DISABLE_SYSTEM:
             dp_blacklist_provider("system");
+            ovs_router_disable_system_routing_table();
             break;
 
         case '?':
@@ -265,10 +279,11 @@ usage(void)
 }
 
 static void
-ovs_vswitchd_exit(struct unixctl_conn *conn, int argc OVS_UNUSED,
-                  const char *argv[] OVS_UNUSED, void *exiting_)
+ovs_vswitchd_exit(struct unixctl_conn *conn, int argc,
+                  const char *argv[], void *exit_args_)
 {
-    bool *exiting = exiting_;
-    *exiting = true;
+    struct ovs_vswitchd_exit_args *exit_args = exit_args_;
+    *exit_args->exiting = true;
+    *exit_args->cleanup = argc == 2 && !strcmp(argv[1], "--cleanup");
     unixctl_command_reply(conn, NULL);
 }

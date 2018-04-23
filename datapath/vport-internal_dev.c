@@ -16,7 +16,6 @@
  * 02110-1301, USA
  */
 
-#include <linux/hardirq.h>
 #include <linux/if_vlan.h>
 #include <linux/kernel.h>
 #include <linux/netdevice.h>
@@ -89,24 +88,37 @@ static const struct ethtool_ops internal_dev_ethtool_ops = {
 	.get_link	= ethtool_op_get_link,
 };
 
-static int internal_dev_change_mtu(struct net_device *netdev, int new_mtu)
+#ifndef HAVE_NET_DEVICE_WITH_MAX_MTU
+static int internal_dev_change_mtu(struct net_device *dev, int new_mtu)
 {
-	if (new_mtu < 68)
+	if (new_mtu < ETH_MIN_MTU) {
+		net_err_ratelimited("%s: Invalid MTU %d requested, hw min %d\n",
+				    dev->name, new_mtu, ETH_MIN_MTU);
 		return -EINVAL;
+	}
 
-	netdev->mtu = new_mtu;
+	if (new_mtu > ETH_MAX_MTU) {
+		net_err_ratelimited("%s: Invalid MTU %d requested, hw max %d\n",
+				    dev->name, new_mtu, ETH_MAX_MTU);
+		return -EINVAL;
+	}
+
+	dev->mtu = new_mtu;
 	return 0;
 }
+#endif
 
 static void internal_dev_destructor(struct net_device *dev)
 {
 	struct vport *vport = ovs_internal_dev_get_vport(dev);
 
 	ovs_vport_free(vport);
+#ifndef HAVE_NEEDS_FREE_NETDEV
 	free_netdev(dev);
+#endif
 }
 
-static struct rtnl_link_stats64 *
+static void
 internal_get_stats(struct net_device *dev, struct rtnl_link_stats64 *stats)
 {
 	int i;
@@ -134,27 +146,17 @@ internal_get_stats(struct net_device *dev, struct rtnl_link_stats64 *stats)
 		stats->tx_bytes         += local_stats.tx_bytes;
 		stats->tx_packets       += local_stats.tx_packets;
 	}
-
-	return stats;
 }
-
-#ifdef HAVE_IFF_PHONY_HEADROOM
-static void internal_set_rx_headroom(struct net_device *dev, int new_hr)
-{
-	dev->needed_headroom = new_hr;
-}
-#endif
 
 static const struct net_device_ops internal_dev_netdev_ops = {
 	.ndo_open = internal_dev_open,
 	.ndo_stop = internal_dev_stop,
 	.ndo_start_xmit = internal_dev_xmit,
 	.ndo_set_mac_address = eth_mac_addr,
+#ifndef HAVE_NET_DEVICE_WITH_MAX_MTU
 	.ndo_change_mtu = internal_dev_change_mtu,
-	.ndo_get_stats64 = internal_get_stats,
-#ifdef HAVE_IFF_PHONY_HEADROOM
-	.ndo_set_rx_headroom = internal_set_rx_headroom,
 #endif
+	.ndo_get_stats64 = (void *)internal_get_stats,
 };
 
 static struct rtnl_link_ops internal_dev_link_ops __read_mostly = {
@@ -165,12 +167,20 @@ static void do_setup(struct net_device *netdev)
 {
 	ether_setup(netdev);
 
+#ifdef HAVE_NET_DEVICE_WITH_MAX_MTU
+	netdev->max_mtu = ETH_MAX_MTU;
+#endif
 	netdev->netdev_ops = &internal_dev_netdev_ops;
 
 	netdev->priv_flags &= ~IFF_TX_SKB_SHARING;
 	netdev->priv_flags |= IFF_LIVE_ADDR_CHANGE | IFF_OPENVSWITCH |
-			      IFF_PHONY_HEADROOM | IFF_NO_QUEUE;
+			      IFF_NO_QUEUE;
+#ifndef HAVE_NEEDS_FREE_NETDEV
 	netdev->destructor = internal_dev_destructor;
+#else
+	netdev->needs_free_netdev = true;
+	netdev->priv_destructor = internal_dev_destructor;
+#endif /* HAVE_NEEDS_FREE_NETDEV */
 	netdev->ethtool_ops = &internal_dev_ethtool_ops;
 	netdev->rtnl_link_ops = &internal_dev_link_ops;
 
@@ -184,7 +194,7 @@ static void do_setup(struct net_device *netdev)
 
 	netdev->vlan_features = netdev->features;
 	netdev->hw_enc_features = netdev->features;
-	netdev->features |= NETIF_F_HW_VLAN_CTAG_TX;
+	netdev->features |= NETIF_F_HW_VLAN_CTAG_TX | NETIF_F_HW_VLAN_STAG_TX;
 	netdev->hw_features = netdev->features & ~NETIF_F_LLTX;
 
 	eth_hw_addr_random(netdev);
@@ -214,9 +224,6 @@ static struct vport *internal_dev_create(const struct vport_parms *parms)
 		goto error_free_netdev;
 	}
 
-#ifdef HAVE_IFF_PHONY_HEADROOM
-	vport->dev->needed_headroom = vport->dp->max_headroom;
-#endif
 	dev_net_set(vport->dev, ovs_dp_get_net(vport->dp));
 	internal_dev = internal_dev_priv(vport->dev);
 	internal_dev->vport = vport;

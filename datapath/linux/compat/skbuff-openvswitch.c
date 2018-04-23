@@ -141,9 +141,9 @@ int rpl_skb_ensure_writable(struct sk_buff *skb, int write_len)
 EXPORT_SYMBOL_GPL(rpl_skb_ensure_writable);
 #endif
 
-#ifndef HAVE_SKB_VLAN_POP
+#if !defined(HAVE___SKB_VLAN_POP) || !defined(HAVE_SKB_VLAN_POP)
 /* remove VLAN header from packet and update csum accordingly. */
-static int __skb_vlan_pop(struct sk_buff *skb, u16 *vlan_tci)
+int rpl___skb_vlan_pop(struct sk_buff *skb, u16 *vlan_tci)
 {
 	struct vlan_hdr *vhdr;
 	unsigned int offset = skb->data - skb_mac_header(skb);
@@ -174,7 +174,9 @@ pull:
 
 	return err;
 }
+#endif
 
+#ifndef HAVE_SKB_VLAN_POP
 int rpl_skb_vlan_pop(struct sk_buff *skb)
 {
 	u16 vlan_tci;
@@ -189,7 +191,7 @@ int rpl_skb_vlan_pop(struct sk_buff *skb)
 			     skb->len < VLAN_ETH_HLEN))
 			return 0;
 
-		err = __skb_vlan_pop(skb, &vlan_tci);
+		err = rpl___skb_vlan_pop(skb, &vlan_tci);
 		if (err)
 			return err;
 	}
@@ -278,7 +280,7 @@ void rpl_kfree_skb_list(struct sk_buff *segs)
 EXPORT_SYMBOL(rpl_kfree_skb_list);
 #endif
 
-#ifndef HAVE_SKB_SCRUB_PACKET_XNET
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,1,0)
 
 #define nf_reset_trace rpl_nf_reset_trace
 static void nf_reset_trace(struct sk_buff *skb)

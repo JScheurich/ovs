@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015 Nicira, Inc.
+ * Copyright (c) 2015, 2017 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -45,10 +45,19 @@ struct table;
 #define ovs_fatal please_use_ctl_fatal_instead_of_ovs_fatal
 
 struct ctl_table_class;
+struct ovsdb_idl_class;
+struct ovsdb_idl_table_class;
 struct cmd_show_table;
-void ctl_init(const struct ctl_table_class *tables,
-              const struct cmd_show_table *cmd_show_tables,
-              void (*ctl_exit_func)(int status));
+
+/* ctl_init() figures out the number of tables on its own and flags an error if
+ * 'ctl_classes' was defined with the wrong number of elements. */
+#define ctl_init(idl_class, table_classes, ctl_classes, cmd_show_table, \
+                 ctl_exit_func)                                         \
+    (BUILD_ASSERT(ARRAY_SIZE(table_classes) == ARRAY_SIZE(ctl_classes)),  \
+     ctl_init__(idl_class, ctl_classes, cmd_show_table, ctl_exit_func))
+void ctl_init__(const struct ovsdb_idl_class *, const struct ctl_table_class *,
+                const struct cmd_show_table *cmd_show_tables,
+                void (*ctl_exit_func)(int status));
 char *ctl_default_db(void);
 OVS_NO_RETURN void ctl_fatal(const char *, ...) OVS_PRINTF_FORMAT(1, 2);
 
@@ -117,10 +126,19 @@ struct ctl_command_syntax {
     void (*postprocess)(struct ctl_context *ctx);
 
     /* A comma-separated list of supported options, e.g. "--a,--b", or the
-     * empty string if the command does not support any options. */
+     * empty string if the command does not support any options.
+     *
+     * Arguments are determined by appending special characters to option
+     * names:
+     *
+     *   - Append "=" (e.g. "--id=") for a required argument.
+     *
+     *   - Append "?" (e.g. "--ovs?") for an optional argument.
+     *
+     *   - Otherwise an option does not accept an argument. */
     const char *options;
 
-    enum { RO, RW } mode;       /* Does this command modify the database? */
+    enum { RO, RW } mode;   /* Does this command modify the database? */
 };
 
 /* A command extracted from command-line input plus the structs for
@@ -139,6 +157,8 @@ struct ctl_command {
 
 bool ctl_might_write_to_db(char **argv);
 const char *ctl_get_db_cmd_usage(void);
+
+const char *ctl_list_db_tables_usage(void);
 void ctl_print_commands(void);
 void ctl_print_options(const struct option *);
 void ctl_add_cmd_options(struct option **, size_t *n_options_p,
@@ -177,7 +197,7 @@ struct weak_ref_table {
 struct cmd_show_table {
     const struct ovsdb_idl_table_class *table;
     const struct ovsdb_idl_column *name_column;
-    const struct ovsdb_idl_column *columns[3]; /* Seems like a good number. */
+    const struct ovsdb_idl_column *columns[4]; /* Seems like a good number. */
     const struct weak_ref_table wref_table;
 };
 
@@ -211,7 +231,7 @@ struct ctl_context {
     /* For implementation with a cache of the contents of the database,
      * this function will be called when the database is changed and the
      * change makes the cache no longer valid. */
-    void (*invalidate_cache)(struct ctl_context *);
+    void (*invalidate_cache_cb)(struct ctl_context *);
 
     /* A command may set this member to true if some prerequisite is not met
      * and the caller should wait for something to change and then retry. */
@@ -226,16 +246,33 @@ void ctl_context_init(struct ctl_context *, struct ctl_command *,
 void ctl_context_done_command(struct ctl_context *, struct ctl_command *);
 void ctl_context_done(struct ctl_context *, struct ctl_command *);
 
+/* A way to identify a particular row in the database based on a user-provided
+ * string.  If all fields are NULL, the struct is ignored.  Otherwise,
+ * 'name_column' designates a column whose table is searched for rows that
+ * match with the user string.  If 'key' is NULL, then 'name_column' should be
+ * a string or integer-valued column; otherwise it should be a map from a
+ * string to one of those types and the value corresponding to 'key' is what is
+ * matched.  If a matching row is found, then:
+ *
+ *    - If 'uuid_column' is NULL, the matching row is the final row.
+ *
+ *    - Otherwise 'uuid_column' must designate a UUID-typed column whose value
+ *      refers to exactly one row, which is the final row.
+ */
 struct ctl_row_id {
-    const struct ovsdb_idl_table_class *table;
     const struct ovsdb_idl_column *name_column;
+    const char *key;
     const struct ovsdb_idl_column *uuid_column;
 };
 
 struct ctl_table_class {
-    struct ovsdb_idl_table_class *class;
-    struct ctl_row_id row_ids[2];
+    struct ctl_row_id row_ids[4];
 };
+
+const struct ovsdb_idl_row *ctl_get_row(struct ctl_context *,
+                                        const struct ovsdb_idl_table_class *,
+                                        const char *record_id,
+                                        bool must_exist);
 
 void ctl_set_column(const char *table_name,
                     const struct ovsdb_idl_row *, const char *arg,

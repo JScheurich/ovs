@@ -263,6 +263,11 @@ static inline void __skb_fill_page_desc(struct sk_buff *skb, int i,
 int rpl_skb_ensure_writable(struct sk_buff *skb, int write_len);
 #endif
 
+#ifndef HAVE___SKB_VLAN_POP
+#define __skb_vlan_pop rpl___skb_vlan_pop
+int rpl___skb_vlan_pop(struct sk_buff *skb, u16 *vlan_tci);
+#endif
+
 #ifndef HAVE_SKB_VLAN_POP
 #define skb_vlan_pop rpl_skb_vlan_pop
 int rpl_skb_vlan_pop(struct sk_buff *skb);
@@ -310,7 +315,7 @@ static inline unsigned char *skb_pull_rcsum(struct sk_buff *skb, unsigned int le
 
 #endif
 
-#ifndef HAVE_SKB_SCRUB_PACKET_XNET
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,1,0)
 #define skb_scrub_packet rpl_skb_scrub_packet
 void rpl_skb_scrub_packet(struct sk_buff *skb, bool xnet);
 #endif
@@ -345,6 +350,52 @@ static inline void skb_postpush_rcsum(struct sk_buff *skb,
 	 */
 	if (skb->ip_summed == CHECKSUM_COMPLETE)
 		skb->csum = csum_partial(start, len, skb->csum);
+}
+#endif
+
+#define skb_checksum_start rpl_skb_checksum_start
+static inline unsigned char *skb_checksum_start(const struct sk_buff *skb)
+{
+	return skb->head + skb->csum_start;
+}
+
+#ifndef HAVE_LCO_CSUM
+static inline __wsum lco_csum(struct sk_buff *skb)
+{
+	unsigned char *csum_start = skb_checksum_start(skb);
+	unsigned char *l4_hdr = skb_transport_header(skb);
+	__wsum partial;
+
+	/* Start with complement of inner checksum adjustment */
+	partial = ~csum_unfold(*(__force __sum16 *)(csum_start +
+				skb->csum_offset));
+
+	/* Add in checksum of our headers (incl. outer checksum
+	 * adjustment filled in by caller) and return result.
+	 */
+	return csum_partial(l4_hdr, csum_start - l4_hdr, partial);
+}
+#endif
+
+#ifndef HAVE_SKB_NFCT
+static inline struct nf_conntrack *skb_nfct(const struct sk_buff *skb)
+{
+#if IS_ENABLED(CONFIG_NF_CONNTRACK)
+       return skb->nfct;
+#else
+       return NULL;
+#endif
+}
+#endif
+
+#ifndef HAVE_SKB_PUT_ZERO
+static inline void *skb_put_zero(struct sk_buff *skb, unsigned int len)
+{
+	void *tmp = skb_put(skb, len);
+
+	memset(tmp, 0, len);
+
+	return tmp;
 }
 #endif
 

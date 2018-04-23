@@ -14,7 +14,7 @@
 # Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
 #
 # Copyright (c) 2005, 2007 XenSource Ltd.
-# Copyright (c) 2010, 2011, 2012, 2013, 2015 Nicira, Inc.
+# Copyright (c) 2010, 2011, 2012, 2013, 2015, 2016, 2017 Nicira, Inc.
 
 #
 # To add new entries to the bugtool, you need to:
@@ -34,25 +34,27 @@
 #
 
 from __future__ import print_function
-from six.moves import input
 
-import getopt
-import re
-import os
 import StringIO
+import commands
+import fcntl
+import getopt
+import hashlib
+import os
+import platform
+import re
 import sys
 import tarfile
 import time
-import commands
-from xml.dom.minidom import parse, getDOMImplementation
+import warnings
 import zipfile
-from subprocess import Popen, PIPE
 from select import select
 from signal import SIGTERM
-import md5
-import platform
-import fcntl
-import warnings
+from subprocess import PIPE, Popen
+
+from xml.dom.minidom import getDOMImplementation, parse
+
+from six.moves import input
 warnings.filterwarnings(action="ignore", category=DeprecationWarning)
 
 OS_RELEASE = platform.release()
@@ -91,6 +93,8 @@ ROUTE_RE = re.compile(r'^.*/route-.*')
 SYSCONFIG_HWCONF = '/etc/sysconfig/hwconf'
 SYSCONFIG_NETWORK = '/etc/sysconfig/network'
 SYSCONFIG_NETWORK_SCRIPTS = '/etc/sysconfig/network-scripts'
+INTERFACES = '/etc/network/interfaces'
+INTERFACESD = '/etc/network/interfaces.d'
 PROC_NET_VLAN_DIR = '/proc/net/vlan'
 PROC_NET_SOFTNET_STAT = '/proc/net/softnet_stat'
 MODPROBE_CONF = '/etc/modprobe.conf'
@@ -125,6 +129,7 @@ os.environ['PATH'] = '/usr/local/sbin:/usr/local/bin:' \
 ARP = 'arp'
 CAT = 'cat'
 CHKCONFIG = 'chkconfig'
+DATE = 'date'
 DF = 'df'
 DMESG = 'dmesg'
 DMIDECODE = 'dmidecode'
@@ -133,13 +138,12 @@ DPKG_QUERY = 'dpkg-query'
 ETHTOOL = 'ethtool'
 FDISK = 'fdisk'
 FIND = 'find'
-IFCONFIG = 'ifconfig'
+IP = 'ip'
 IPTABLES = 'iptables'
 ISCSIADM = 'iscsiadm'
 LOSETUP = 'losetup'
 LS = 'ls'
 LSPCI = 'lspci'
-MD5SUM = 'md5sum'
 MODINFO = 'modinfo'
 MPPUTIL = 'mppUtil'
 MULTIPATHD = 'multipathd'
@@ -151,6 +155,7 @@ PS = 'ps'
 ROUTE = 'route'
 RPM = 'rpm'
 SG_MAP = 'sg_map'
+SHA256_SUM = 'sha256sum'
 SYSCTL = 'sysctl'
 TC = 'tc'
 UPTIME = 'uptime'
@@ -221,6 +226,8 @@ dbg = False
 log_days = 20
 log_last_mod_time = None
 free_disk_space = None
+# Default value for delay between repeated commands
+command_delay = 10
 
 
 def cap(key, pii=PII_MAYBE, min_size=-1, max_size=-1, min_time=-1,
@@ -262,7 +269,8 @@ def output_ts(x):
     output("[%s]  %s" % (time.strftime("%x %X %Z"), x))
 
 
-def cmd_output(cap, args, label=None, filter=None, binary=False):
+def cmd_output(cap, args, label=None, filter=None,
+               binary=False, repeat_count=1):
     if cap in entries:
         if not label:
             if isinstance(args, list):
@@ -272,7 +280,7 @@ def cmd_output(cap, args, label=None, filter=None, binary=False):
             else:
                 label = args
         data[label] = {'cap': cap, 'cmd_args': args, 'filter': filter,
-                       'binary': binary}
+                       'binary': binary, 'repeat_count': repeat_count}
 
 
 def file_output(cap, path_list, newest_first=False, last_mod_time=None):
@@ -334,18 +342,38 @@ def func_output(cap, label, func):
 
 
 def collect_data():
-    process_lists = {}
+    first_run = True
+
+    while True:
+        process_lists = {}
+
+        for (k, v) in data.items():
+            cap = v['cap']
+            if 'cmd_args' in v:
+                if 'output' not in v.keys():
+                    v['output'] = StringIOmtime()
+                if v['repeat_count'] > 0:
+                    if cap not in process_lists:
+                        process_lists[cap] = []
+                    process_lists[cap].append(
+                            ProcOutput(v['cmd_args'], caps[cap][MAX_TIME],
+                                       v['output'], v['filter'], v['binary']))
+                    v['repeat_count'] -= 1
+
+        if bool(process_lists):
+            if not first_run:
+                output_ts("Waiting %d sec between repeated commands" %
+                          command_delay)
+                time.sleep(command_delay)
+            else:
+                first_run = False
+            run_procs(process_lists.values())
+        else:
+            break
 
     for (k, v) in data.items():
         cap = v['cap']
-        if 'cmd_args' in v:
-            v['output'] = StringIOmtime()
-            if cap not in process_lists:
-                process_lists[cap] = []
-            process_lists[cap].append(
-                ProcOutput(v['cmd_args'], caps[cap][MAX_TIME], v['output'],
-                           v['filter'], v['binary']))
-        elif 'filename' in v and v['filename'].startswith('/proc/'):
+        if 'filename' in v and v['filename'].startswith('/proc/'):
             # proc files must be read into memory
             try:
                 f = open(v['filename'], 'r')
@@ -363,13 +391,11 @@ def collect_data():
             if check_space(cap, k, len(s)):
                 v['output'] = StringIOmtime(s)
 
-    run_procs(process_lists.values())
-
 
 def main(argv=None):
     global ANSWER_YES_TO_ALL, SILENT_MODE
     global entries, data, dbg, unlimited_data, free_disk_space
-    global log_days, log_last_mod_time
+    global log_days, log_last_mod_time, command_delay
 
     # Filter flags
     only_ovs_info = False
@@ -392,6 +418,7 @@ Options for categories of data to collect:
   --all                      collect all categories
   --ovs                      collect only directly OVS-related info
   --log-days=DAYS            collect DAYS worth of old logs
+  --delay=DELAY              set delay between repeated command
   -y, --yestoall             suppress prompts to confirm collection
   --capabilities             print categories as XML on stdout, then exit
 
@@ -420,7 +447,7 @@ Output options:
         (options, params) = getopt.gnu_getopt(
             argv, 'sy', ['capabilities', 'silent', 'yestoall', 'entries=',
                          'output=', 'outfd=', 'outfile=', 'all', 'unlimited',
-                         'debug', 'ovs', 'log-days='])
+                         'debug', 'ovs', 'log-days=', 'delay='])
     except getopt.GetoptError as opterr:
         print(opterr, file=sys.stderr)
         return 2
@@ -486,6 +513,9 @@ Output options:
         if k == '--log-days':
             log_days = int(v)
 
+        if k == '--delay':
+            command_delay = int(v)
+
     if len(params) != 1:
         print("Invalid additional arguments", str(params), file=sys.stderr)
         return 2
@@ -526,8 +556,8 @@ exclude those logs from the archive.
 
     file_output(CAP_BOOT_LOADER, [GRUB_CONFIG])
     cmd_output(CAP_BOOT_LOADER, [LS, '-lR', '/boot'])
-    cmd_output(CAP_BOOT_LOADER, [MD5SUM, BOOT_KERNEL, BOOT_INITRD],
-               label='vmlinuz-initrd.md5sum')
+    cmd_output(CAP_BOOT_LOADER, [SHA256_SUM, BOOT_KERNEL, BOOT_INITRD],
+               label='vmlinuz-initrd.sha256sum')
 
     cmd_output(CAP_DISK_INFO, [FDISK, '-l'])
     file_output(CAP_DISK_INFO, [PROC_PARTITIONS, PROC_MOUNTS])
@@ -570,14 +600,15 @@ exclude those logs from the archive.
 
     tree_output(CAP_NETWORK_CONFIG, SYSCONFIG_NETWORK_SCRIPTS, IFCFG_RE)
     tree_output(CAP_NETWORK_CONFIG, SYSCONFIG_NETWORK_SCRIPTS, ROUTE_RE)
-    file_output(CAP_NETWORK_CONFIG,
-                [SYSCONFIG_NETWORK, RESOLV_CONF, NSSWITCH_CONF, HOSTS])
+    tree_output(CAP_NETWORK_CONFIG, INTERFACESD)
+    file_output(CAP_NETWORK_CONFIG, [SYSCONFIG_NETWORK, RESOLV_CONF,
+                NSSWITCH_CONF, HOSTS, INTERFACES])
     file_output(CAP_NETWORK_CONFIG,
                 [NTP_CONF, IPTABLES_CONFIG, HOSTS_ALLOW, HOSTS_DENY])
     file_output(CAP_NETWORK_CONFIG, [OPENVSWITCH_DEFAULT_SWITCH,
                 OPENVSWITCH_SYSCONFIG_SWITCH])
 
-    cmd_output(CAP_NETWORK_INFO, [IFCONFIG, '-a'])
+    cmd_output(CAP_NETWORK_INFO, [IP, 'addr', 'show'])
     cmd_output(CAP_NETWORK_INFO, [ROUTE, '-n'])
     cmd_output(CAP_NETWORK_INFO, [ARP, '-n'])
     cmd_output(CAP_NETWORK_INFO, [NETSTAT, '-an'])
@@ -627,14 +658,12 @@ exclude those logs from the archive.
 
     ovs_logs = ([OPENVSWITCH_LOG_DIR + x for x in
         ['ovs-vswitchd.log', 'ovsdb-server.log',
-        'ovs-xapi-sync.log', 'ovs-monitor-ipsec.log', 'ovs-ctl.log']])
+        'ovs-xapi-sync.log', 'ovs-ctl.log']])
     for log in ovs_logs:
         prefix_output(CAP_OPENVSWITCH_LOGS, log,
                       last_mod_time=log_last_mod_time)
 
-    if not os.path.exists('/var/log/dmesg') and \
-       not os.path.exists('/var/log/boot'):
-        cmd_output(CAP_SYSTEM_LOGS, [DMESG])
+    cmd_output(CAP_SYSTEM_LOGS, [DMESG])
 
     cmd_output(CAP_SYSTEM_SERVICES, [CHKCONFIG, '--list'])
 
@@ -654,7 +683,7 @@ exclude those logs from the archive.
     if only_ovs_info:
         filters.add('ovs')
         ovs_info_caps = [CAP_NETWORK_STATUS, CAP_SYSTEM_LOGS,
-                         CAP_NETWORK_CONFIG]
+                         CAP_OPENVSWITCH_LOGS, CAP_NETWORK_CONFIG]
         ovs_info_list = ['process-tree']
         # We cannot use iteritems, since we modify 'data' as we pass through
         for (k, v) in data.items():
@@ -729,10 +758,10 @@ exclude those logs from the archive.
 
 def dump_scsi_hosts(cap):
     output = ''
-    l = os.listdir('/sys/class/scsi_host')
-    l.sort()
+    scsi_list = os.listdir('/sys/class/scsi_host')
+    scsi_list.sort()
 
-    for h in l:
+    for h in scsi_list:
         procname = ''
         try:
                 f = open('/sys/class/scsi_host/%s/proc_name' % h)
@@ -957,8 +986,20 @@ def load_plugins(just_capabilities=False, filter=None):
                     if label == '':
                         label = None
                     binary = getBoolAttr(el, 'binary')
-                    cmd_output(dir,
-                               getText(el.childNodes), label, binary=binary)
+                    try:
+                        repeat_count = int(el.getAttribute("repeat"))
+                        if repeat_count > 1:
+                            cmd_output(dir,
+                                       DATE + ';' + getText(el.childNodes),
+                                       label, binary=binary,
+                                       repeat_count=repeat_count)
+                        else:
+                            cmd_output(dir, getText(el.childNodes),
+                                       label, binary=binary,
+                                       repeat_count=repeat_count)
+                    except:
+                        cmd_output(dir, getText(el.childNodes), label,
+                                   binary=binary)
 
 
 def make_tar(subdir, suffix, output_fd, output_file):
@@ -1071,14 +1112,14 @@ def inventory_entry(document, subdir, k, v):
         el.setAttribute('capability', v['cap'])
         el.setAttribute('filename',
                         os.path.join(subdir, construct_filename(k, v)))
-        el.setAttribute('md5sum', md5sum(v))
+        el.setAttribute('sha256sum', sha256(v))
         document.getElementsByTagName(INVENTORY_XML_ROOT)[0].appendChild(el)
     except:
         pass
 
 
-def md5sum(d):
-    m = md5.new()
+def sha256(d):
+    m = hashlib.sha256()
     if 'filename' in d:
         f = open(d['filename'])
         data = f.read(1024)
@@ -1118,9 +1159,9 @@ def update_cap_size(cap, size):
 
 def update_cap(cap, k, v):
     global caps
-    l = list(caps[cap])
-    l[k] = v
-    caps[cap] = tuple(l)
+    temp = list(caps[cap])
+    temp[k] = v
+    caps[cap] = tuple(temp)
 
 
 def size_of_dir(d, pattern=None, negate=False):

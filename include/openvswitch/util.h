@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013, 2014 Nicira, Inc.
+ * Copyright (c) 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2016, 2017 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -44,13 +44,16 @@ const char *ovs_get_program_version(void);
      : (X) <= UINT_MAX / (Y) ? (unsigned int) (X) * (unsigned int) (Y)  \
      : UINT_MAX)
 
-/* Like the standard assert macro, except writes the failure message to the
- * log. */
+/* Like the standard assert macro, except:
+ *
+ *    - Writes the failure message to the log.
+ *
+ *    - Always evaluates the condition, even with NDEBUG. */
 #ifndef NDEBUG
 #define ovs_assert(CONDITION)                                           \
-    if (!OVS_LIKELY(CONDITION)) {                                       \
-        ovs_assert_failure(OVS_SOURCE_LOCATOR, __func__, #CONDITION);       \
-    }
+    (OVS_LIKELY(CONDITION)                                              \
+     ? (void) 0                                                         \
+     : ovs_assert_failure(OVS_SOURCE_LOCATOR, __func__, #CONDITION))
 #else
 #define ovs_assert(CONDITION) ((void) (CONDITION))
 #endif
@@ -73,11 +76,7 @@ OVS_NO_RETURN void ovs_assert_failure(const char *, const char *, const char *);
     ((void) sizeof ((int) ((POINTER) == (TYPE) (POINTER))))
 
 /* Casts 'pointer' to 'type' and issues a compiler warning if the cast changes
- * anything other than an outermost "const" or "volatile" qualifier.
- *
- * The cast to int is present only to suppress an "expression using sizeof
- * bool" warning from "sparse" (see
- * http://permalink.gmane.org/gmane.comp.parsers.sparse/2967). */
+ * anything other than an outermost "const" or "volatile" qualifier. */
 #define CONST_CAST(TYPE, POINTER)                               \
     (BUILD_ASSERT_TYPE(POINTER, TYPE),                          \
      (TYPE) (POINTER))
@@ -161,6 +160,89 @@ OVS_NO_RETURN void ovs_assert_failure(const char *, const char *, const char *);
 
 /* Returns true if X is a power of 2, otherwise false. */
 #define IS_POW2(X) ((X) && !((X) & ((X) - 1)))
+
+/* Expands to an anonymous union that contains:
+ *
+ *    - MEMBERS in a nested anonymous struct.
+ *
+ *    - An array as large as MEMBERS plus padding to a multiple of UNIT bytes.
+ *
+ * The effect is to pad MEMBERS to a multiple of UNIT bytes.
+ *
+ * For example, the struct below is 8 bytes long, with 6 bytes of padding:
+ *
+ *     struct padded_struct {
+ *         PADDED_MEMBERS(8, uint8_t x; uint8_t y;);
+ *     };
+ */
+#define PAD_PASTE2(x, y) x##y
+#define PAD_PASTE(x, y) PAD_PASTE2(x, y)
+#define PAD_ID PAD_PASTE(pad, __COUNTER__)
+#ifndef __cplusplus
+#define PADDED_MEMBERS(UNIT, MEMBERS)                               \
+    union {                                                         \
+        struct { MEMBERS };                                         \
+        uint8_t PAD_ID[ROUND_UP(sizeof(struct { MEMBERS }), UNIT)]; \
+    }
+#else
+/* C++ doesn't allow a type declaration within "sizeof", but it does support
+ * scoping for member names, so we can just declare a second member, with a
+ * name and the same type, and then use its size. */
+#define PADDED_MEMBERS(UNIT, MEMBERS)                                       \
+    struct named_member__ { MEMBERS };                                      \
+    union {                                                                 \
+        struct { MEMBERS };                                                 \
+        uint8_t PAD_ID[ROUND_UP(sizeof(struct named_member__), UNIT)];      \
+    }
+#endif
+
+/* Similar to PADDED_MEMBERS with additional cacheline marker:
+ *
+ *    - OVS_CACHE_LINE_MARKER is a cacheline marker
+ *    - MEMBERS in a nested anonymous struct.
+ *    - An array as large as MEMBERS plus padding to a multiple of UNIT bytes.
+ *
+ * The effect is to add cacheline marker and pad MEMBERS to a multiple of
+ * UNIT bytes.
+ *
+ * Example:
+ *     struct padded_struct {
+ *         PADDED_MEMBERS_CACHELINE_MARKER(CACHE_LINE_SIZE, cacheline0,
+ *             uint8_t x;
+ *             uint8_t y;
+ *         );
+ *     };
+ *
+ * The PADDED_MEMBERS_CACHELINE_MARKER macro in above structure expands as:
+ *
+ *     struct padded_struct {
+ *            union {
+ *                    OVS_CACHE_LINE_MARKER cacheline0;
+ *                    struct {
+ *                            uint8_t x;
+ *                            uint8_t y;
+ *                    };
+ *                    uint8_t         pad0[64];
+ *            };
+ *            *--- cacheline 1 boundary (64 bytes) ---*
+ *     };
+ */
+#ifndef __cplusplus
+#define PADDED_MEMBERS_CACHELINE_MARKER(UNIT, CACHELINE, MEMBERS)   \
+    union {                                                         \
+        OVS_CACHE_LINE_MARKER CACHELINE;                            \
+        struct { MEMBERS };                                         \
+        uint8_t PAD_ID[ROUND_UP(sizeof(struct { MEMBERS }), UNIT)]; \
+    }
+#else
+#define PADDED_MEMBERS_CACHELINE_MARKER(UNIT, CACHELINE, MEMBERS)           \
+    struct struct_##CACHELINE { MEMBERS };                                  \
+    union {                                                                 \
+        OVS_CACHE_LINE_MARKER CACHELINE;                                    \
+        struct { MEMBERS };                                                 \
+        uint8_t PAD_ID[ROUND_UP(sizeof(struct struct_##CACHELINE), UNIT)];  \
+    }
+#endif
 
 static inline bool
 is_pow2(uintmax_t x)

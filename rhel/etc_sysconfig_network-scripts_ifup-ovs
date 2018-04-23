@@ -60,10 +60,10 @@ fi
 	fi
 done
 
-SERVICE_UNIT=/usr/lib/systemd/system/openvswitch-nonetwork.service
+SERVICE_UNIT=/usr/lib/systemd/system/openvswitch.service
 if [ -f $SERVICE_UNIT ] && [ -x /usr/bin/systemctl ]; then
-	if ! systemctl --quiet is-active openvswitch-nonetwork.service; then
-		systemctl start openvswitch-nonetwork.service
+	if ! systemctl --quiet is-active openvswitch.service; then
+		systemctl start openvswitch.service
 	fi
 else
 	if [ ! -f /var/lock/subsys/openvswitch ]; then
@@ -167,10 +167,18 @@ case "$TYPE" in
 		;;
 	OVSDPDKPort)
 		ifup_ovs_bridge
+		BRIDGE_MAC_ORIG=$(get_hwaddr $OVS_BRIDGE)
 		ovs-vsctl -t ${TIMEOUT} \
 			-- --if-exists del-port "$OVS_BRIDGE" "$DEVICE" \
 			-- add-port "$OVS_BRIDGE" "$DEVICE" $OVS_OPTIONS \
 			-- set Interface "$DEVICE" type=dpdk ${OVS_EXTRA+-- $OVS_EXTRA}
+		BRIDGE_MAC=$(get_hwaddr $OVS_BRIDGE)
+		# The bridge may change its MAC to be the lower one among all its
+		# ports. If that happens, bridge configuration (e.g. routes) will
+		# be lost. Restore the post-up bridge configuration again.
+		if [ "$BRIDGE_MAC_ORIG" != "$BRIDGE_MAC" ]; then
+			${OTHERSCRIPT} "$OVS_BRIDGE"
+		fi
 		;;
 	OVSDPDKRPort)
 		ifup_ovs_bridge
@@ -179,19 +187,37 @@ case "$TYPE" in
 			-- add-port "$OVS_BRIDGE" "$DEVICE" $OVS_OPTIONS \
 			-- set Interface "$DEVICE" type=dpdkr ${OVS_EXTRA+-- $OVS_EXTRA}
 		;;
-	OVSDPDVhostPort)
-		ifup_ovs_bridge
-		ovs-vsctl -t ${TIMEOUT} \
-			-- --if-exists del-port "$OVS_BRIDGE" "$DEVICE" \
-			-- add-port "$OVS_BRIDGE" "$DEVICE" $OVS_OPTIONS \
-			-- set Interface "$DEVICE" type=dpdkvhost ${OVS_EXTRA+-- $OVS_EXTRA}
-		;;
 	OVSDPDKVhostUserPort)
 		ifup_ovs_bridge
+		PORT_TYPE="dpdkvhostuser"
+		PORT_PATH=""
+		if [ "$OVS_PORT_MODE" == "client" ]; then
+			PORT_TYPE="dpdkvhostuserclient"
+			PORT_PATH="options:vhost-server-path=${OVS_PORT_PATH}"
+		fi
 		ovs-vsctl -t ${TIMEOUT} \
 			-- --if-exists del-port "$OVS_BRIDGE" "$DEVICE" \
 			-- add-port "$OVS_BRIDGE" "$DEVICE" $OVS_OPTIONS \
-			-- set Interface "$DEVICE" type=dpdkvhostuser ${OVS_EXTRA+-- $OVS_EXTRA}
+			-- set Interface "$DEVICE" type=$PORT_TYPE \
+			$PORT_PATH \
+			${OVS_EXTRA+-- $OVS_EXTRA}
+		;;
+	OVSDPDKBond)
+		ifup_ovs_bridge
+		BRIDGE_MAC_ORIG=$(get_hwaddr $OVS_BRIDGE)
+		for _iface in $BOND_IFACES; do
+			IFACE_TYPES="${IFACE_TYPES} -- set interface ${_iface} type=dpdk"
+		done
+		ovs-vsctl -t ${TIMEOUT} \
+			-- --if-exists del-port "$OVS_BRIDGE" "$DEVICE" \
+			-- add-bond "$OVS_BRIDGE" "$DEVICE" ${BOND_IFACES} $OVS_OPTIONS ${IFACE_TYPES} ${OVS_EXTRA+-- $OVS_EXTRA}
+		BRIDGE_MAC=$(get_hwaddr $OVS_BRIDGE)
+		# The bridge may change its MAC to be the lower one among all its
+		# ports. If that happens, bridge configuration (e.g. routes) will
+		# be lost. Restore the post-up bridge configuration again.
+		if [ "$BRIDGE_MAC_ORIG" != "$BRIDGE_MAC" ]; then
+			${OTHERSCRIPT} "$OVS_BRIDGE"
+		fi
 		;;
 	*)
 		echo $"Invalid OVS interface type $TYPE"

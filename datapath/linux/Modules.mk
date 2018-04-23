@@ -29,6 +29,7 @@ openvswitch_headers += \
 	linux/compat/gso.h \
 	linux/compat/include/linux/percpu.h \
 	linux/compat/include/linux/bug.h \
+	linux/compat/include/linux/cache.h \
 	linux/compat/include/linux/compiler.h \
 	linux/compat/include/linux/compiler-gcc.h \
 	linux/compat/include/linux/cpumask.h \
@@ -63,6 +64,7 @@ openvswitch_headers += \
 	linux/compat/include/linux/u64_stats_sync.h \
 	linux/compat/include/linux/udp.h \
 	linux/compat/include/linux/workqueue.h \
+	linux/compat/include/linux/timekeeping.h \
 	linux/compat/include/net/checksum.h \
 	linux/compat/include/net/dst.h \
 	linux/compat/include/net/dst_cache.h \
@@ -82,6 +84,7 @@ openvswitch_headers += \
 	linux/compat/include/net/mpls.h \
 	linux/compat/include/net/net_namespace.h \
 	linux/compat/include/net/netlink.h \
+	linux/compat/include/net/protocol.h \
 	linux/compat/include/net/route.h \
 	linux/compat/include/net/rtnetlink.h \
 	linux/compat/include/net/udp.h \
@@ -89,10 +92,13 @@ openvswitch_headers += \
 	linux/compat/include/net/sock.h \
 	linux/compat/include/net/stt.h \
 	linux/compat/include/net/vrf.h \
+	linux/compat/include/net/tun_proto.h \
+	linux/compat/include/net/nsh.h \
 	linux/compat/include/net/vxlan.h \
 	linux/compat/include/net/netfilter/nf_conntrack.h \
 	linux/compat/include/net/netfilter/nf_conntrack_core.h \
 	linux/compat/include/net/netfilter/nf_conntrack_expect.h \
+	linux/compat/include/net/netfilter/nf_conntrack_helper.h \
 	linux/compat/include/net/netfilter/nf_conntrack_labels.h \
 	linux/compat/include/net/netfilter/nf_conntrack_seqadj.h \
 	linux/compat/include/net/netfilter/nf_conntrack_zones.h \

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2013, 2014, 2015, 2016 Nicira, Inc.
+ * Copyright (c) 2012, 2013, 2014, 2015, 2016, 2017 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,7 +40,10 @@
 
 #include "openvswitch/ofp-errors.h"
 #include "openvswitch/types.h"
-#include "util.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 struct ovs_list;
 
@@ -171,13 +174,17 @@ enum ofpraw {
     OFPRAW_OFPT10_PORT_STATUS,
     /* OFPT 1.1-1.3 (12): struct ofp_port_status, struct ofp11_port. */
     OFPRAW_OFPT11_PORT_STATUS,
-    /* OFPT 1.4+ (12): struct ofp_port_status, struct ofp14_port, uint8_t[8][]. */
+    /* OFPT 1.4-1.5 (12): struct ofp_port_status, struct ofp14_port, uint8_t[8][]. */
     OFPRAW_OFPT14_PORT_STATUS,
+    /* OFPT 1.6+ (12): struct ofp_port_status, struct ofp16_port, uint8_t[8][]. */
+    OFPRAW_OFPT16_PORT_STATUS,
 
     /* OFPT 1.0 (13): struct ofp10_packet_out, uint8_t[]. */
     OFPRAW_OFPT10_PACKET_OUT,
-    /* OFPT 1.1+ (13): struct ofp11_packet_out, uint8_t[]. */
+    /* OFPT 1.1-1.4 (13): struct ofp11_packet_out, uint8_t[]. */
     OFPRAW_OFPT11_PACKET_OUT,
+    /* OFPT 1.5+ (13): struct ofp15_packet_out, uint8_t[]. */
+    OFPRAW_OFPT15_PACKET_OUT,
 
     /* OFPT 1.0 (14): struct ofp10_flow_mod, uint8_t[8][]. */
     OFPRAW_OFPT10_FLOW_MOD,
@@ -195,8 +202,10 @@ enum ofpraw {
     OFPRAW_OFPT10_PORT_MOD,
     /* OFPT 1.1-1.3 (16): struct ofp11_port_mod. */
     OFPRAW_OFPT11_PORT_MOD,
-    /* OFPT 1.4+ (16): struct ofp14_port_mod, uint8_t[8][]. */
+    /* OFPT 1.4-1.5 (16): struct ofp14_port_mod, uint8_t[8][]. */
     OFPRAW_OFPT14_PORT_MOD,
+    /* OFPT 1.6+ (16): struct ofp16_port_mod, uint8_t[8][]. */
+    OFPRAW_OFPT16_PORT_MOD,
 
     /* OFPT 1.1-1.3 (17): struct ofp11_table_mod. */
     OFPRAW_OFPT11_TABLE_MOD,
@@ -253,6 +262,8 @@ enum ofpraw {
     /* OFPT 1.3+ (29): struct ofp13_meter_mod, uint8_t[8][]. */
     OFPRAW_OFPT13_METER_MOD,
 
+    /* ONFT 1.3 (1911): struct ofp14_role_status, uint8_t[8][]. */
+    OFPRAW_ONFT13_ROLE_STATUS,
     /* OFPT 1.4+ (30): struct ofp14_role_status, uint8_t[8][]. */
     OFPRAW_OFPT14_ROLE_STATUS,
 
@@ -432,13 +443,13 @@ enum ofpraw {
  * Nicira extensions that correspond to standard OpenFlow messages are listed
  * alongside the standard versions above. */
 
-    /* NXT 1.0 (12): struct nx_set_flow_format. */
+    /* NXT 1.0 (12): ovs_be32. */
     OFPRAW_NXT_SET_FLOW_FORMAT,
 
-    /* NXT 1.0+ (15): struct nx_flow_mod_table_id. */
+    /* NXT 1.0+ (15): uint8_t[8]. */
     OFPRAW_NXT_FLOW_MOD_TABLE_ID,
 
-    /* NXT 1.0+ (16): struct nx_set_packet_in_format. */
+    /* NXT 1.0+ (16): ovs_be32. */
     OFPRAW_NXT_SET_PACKET_IN_FORMAT,
 
     /* NXT 1.0+ (18): void. */
@@ -467,6 +478,9 @@ enum ofpraw {
 
     /* NXT 1.0+ (28): uint8_t[8][]. */
     OFPRAW_NXT_RESUME,
+
+    /* NXT 1.0+ (29): struct nx_zone_id. */
+    OFPRAW_NXT_CT_FLUSH_ZONE,
 
     /* NXST 1.0+ (3): void. */
     OFPRAW_NXST_IPFIX_BRIDGE_REQUEST,
@@ -550,11 +564,13 @@ enum ofptype {
                                   * OFPRAW_NXT_FLOW_REMOVED. */
     OFPTYPE_PORT_STATUS,         /* OFPRAW_OFPT10_PORT_STATUS.
                                   * OFPRAW_OFPT11_PORT_STATUS.
-                                  * OFPRAW_OFPT14_PORT_STATUS. */
+                                  * OFPRAW_OFPT14_PORT_STATUS.
+                                  * OFPRAW_OFPT16_PORT_STATUS. */
 
     /* Controller command messages. */
     OFPTYPE_PACKET_OUT,          /* OFPRAW_OFPT10_PACKET_OUT.
-                                  * OFPRAW_OFPT11_PACKET_OUT. */
+                                  * OFPRAW_OFPT11_PACKET_OUT.
+                                  * OFPRAW_OFPT15_PACKET_OUT. */
     OFPTYPE_FLOW_MOD,            /* OFPRAW_OFPT10_FLOW_MOD.
                                   * OFPRAW_OFPT11_FLOW_MOD.
                                   * OFPRAW_NXT_FLOW_MOD. */
@@ -562,7 +578,8 @@ enum ofptype {
                                   * OFPRAW_OFPT15_GROUP_MOD. */
     OFPTYPE_PORT_MOD,            /* OFPRAW_OFPT10_PORT_MOD.
                                   * OFPRAW_OFPT11_PORT_MOD.
-                                  * OFPRAW_OFPT14_PORT_MOD. */
+                                  * OFPRAW_OFPT14_PORT_MOD.
+                                  * OFPRAW_OFPT16_PORT_MOD. */
     OFPTYPE_TABLE_MOD,           /* OFPRAW_OFPT11_TABLE_MOD.
                                   * OFPRAW_OFPT14_TABLE_MOD. */
 
@@ -600,7 +617,8 @@ enum ofptype {
     OFPTYPE_METER_MOD,            /* OFPRAW_OFPT13_METER_MOD. */
 
     /* Controller role change event messages. */
-    OFPTYPE_ROLE_STATUS,          /* OFPRAW_OFPT14_ROLE_STATUS. */
+    OFPTYPE_ROLE_STATUS,          /* OFPRAW_ONFT13_ROLE_STATUS.
+                                   * OFPRAW_OFPT14_ROLE_STATUS. */
 
     /* Request forwarding by the switch. */
     OFPTYPE_REQUESTFORWARD,       /* OFPRAW_OFPT14_REQUESTFORWARD. */
@@ -707,6 +725,7 @@ enum ofptype {
     OFPTYPE_IPFIX_BRIDGE_STATS_REPLY, /* OFPRAW_NXST_IPFIX_BRIDGE_REPLY */
     OFPTYPE_IPFIX_FLOW_STATS_REQUEST, /* OFPRAW_NXST_IPFIX_FLOW_REQUEST */
     OFPTYPE_IPFIX_FLOW_STATS_REPLY,   /* OFPRAW_NXST_IPFIX_FLOW_REPLY */
+    OFPTYPE_CT_FLUSH_ZONE,            /* OFPRAW_NXT_CT_FLUSH_ZONE. */
 
     /* Flow monitor extension. */
     OFPTYPE_FLOW_MONITOR_CANCEL,        /* OFPRAW_NXT_FLOW_MONITOR_CANCEL. */
@@ -764,5 +783,9 @@ enum ofpraw ofpmp_decode_raw(struct ovs_list *);
 /* Decoding multipart replies. */
 uint16_t ofpmp_flags(const struct ofp_header *);
 bool ofpmp_more(const struct ofp_header *);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* ofp-msgs.h */

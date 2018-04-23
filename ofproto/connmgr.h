@@ -21,15 +21,18 @@
 #include "openvswitch/hmap.h"
 #include "openvswitch/list.h"
 #include "openvswitch/match.h"
-#include "openvswitch/ofp-util.h"
+#include "openvswitch/ofp-connection.h"
 #include "ofproto.h"
 #include "ofproto-provider.h"
 #include "openflow/nicira-ext.h"
 #include "openvswitch/ofp-errors.h"
+#include "openvswitch/ofp-packet.h"
 #include "openvswitch/types.h"
 
 struct nlattr;
 struct ofconn;
+struct ofputil_flow_removed;
+struct ofputil_requestforward;
 struct rule;
 struct simap;
 struct sset;
@@ -71,7 +74,8 @@ void ofproto_async_msg_free(struct ofproto_async_msg *);
 /* Basics. */
 struct connmgr *connmgr_create(struct ofproto *ofproto,
                                const char *dpif_name, const char *local_name);
-void connmgr_destroy(struct connmgr *);
+void connmgr_destroy(struct connmgr *)
+    OVS_REQUIRES(ofproto_mutex);
 
 void connmgr_run(struct connmgr *,
                  void (*handle_openflow)(struct ofconn *,
@@ -108,8 +112,9 @@ void ofconn_set_role(struct ofconn *, enum ofp12_controller_role);
 enum ofputil_protocol ofconn_get_protocol(const struct ofconn *);
 void ofconn_set_protocol(struct ofconn *, enum ofputil_protocol);
 
-enum nx_packet_in_format ofconn_get_packet_in_format(struct ofconn *);
-void ofconn_set_packet_in_format(struct ofconn *, enum nx_packet_in_format);
+enum ofputil_packet_in_format ofconn_get_packet_in_format(struct ofconn *);
+void ofconn_set_packet_in_format(struct ofconn *,
+                                 enum ofputil_packet_in_format);
 
 void ofconn_set_controller_id(struct ofconn *, uint16_t controller_id);
 
@@ -128,14 +133,11 @@ void ofconn_send_replies(const struct ofconn *, struct ovs_list *);
 void ofconn_send_error(const struct ofconn *, const struct ofp_header *request,
                        enum ofperr);
 
-enum ofperr ofconn_pktbuf_retrieve(struct ofconn *, uint32_t id,
-                                   struct dp_packet **bufferp, ofp_port_t *in_port);
-
 struct ofp_bundle;
 
 struct ofp_bundle *ofconn_get_bundle(struct ofconn *, uint32_t id);
-enum ofperr ofconn_insert_bundle(struct ofconn *, struct ofp_bundle *);
-enum ofperr ofconn_remove_bundle(struct ofconn *, struct ofp_bundle *);
+void ofconn_insert_bundle(struct ofconn *, struct ofp_bundle *);
+void ofconn_remove_bundle(struct ofconn *, struct ofp_bundle *);
 
 /* Logging flow_mod summaries. */
 void ofconn_report_flow_mod(struct ofconn *, enum ofp_flow_mod_command);
@@ -145,7 +147,8 @@ bool connmgr_wants_packet_in_on_miss(struct connmgr *mgr);
 void connmgr_send_port_status(struct connmgr *, struct ofconn *source,
                               const struct ofputil_phy_port *, uint8_t reason);
 void connmgr_send_flow_removed(struct connmgr *,
-                               const struct ofputil_flow_removed *);
+                               const struct ofputil_flow_removed *)
+    OVS_REQUIRES(ofproto_mutex);
 void connmgr_send_async_msg(struct connmgr *,
                             const struct ofproto_async_msg *);
 void ofconn_send_role_status(struct ofconn *ofconn, uint32_t role,

@@ -31,10 +31,10 @@ static inline int rpl_iptunnel_pull_header(struct sk_buff *skb, int hdr_len,
 }
 
 int ovs_iptunnel_handle_offloads(struct sk_buff *skb,
-				 bool csum_help, int gso_type_mask,
+				 int gso_type_mask,
 				 void (*fix_segment)(struct sk_buff *));
 
-/* This is is required to compile upstream gre.h. gre_handle_offloads()
+/* This is required to compile upstream gre.h. gre_handle_offloads()
  * is defined in gre.h and needs iptunnel_handle_offloads(). This provides
  * default signature for this function.
  * rpl prefix is to make OVS build happy.

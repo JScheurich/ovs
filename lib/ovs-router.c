@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014, 2015, 2016 Nicira, Inc.
+ * Copyright (c) 2014, 2015, 2016, 2017 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,12 +18,13 @@
 
 #include "ovs-router.h"
 
+#include <sys/types.h>
+#include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <sys/socket.h>
 #include <net/if.h>
-#include <netinet/in.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,6 +34,7 @@
 #include "command-line.h"
 #include "compiler.h"
 #include "dpif.h"
+#include "fatal-signal.h"
 #include "openvswitch/dynamic-string.h"
 #include "netdev.h"
 #include "packets.h"
@@ -43,11 +45,18 @@
 #include "unixctl.h"
 #include "util.h"
 #include "unaligned.h"
-#include "unixctl.h"
-#include "util.h"
+#include "openvswitch/vlog.h"
+
+VLOG_DEFINE_THIS_MODULE(ovs_router);
+
+static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
 
 static struct ovs_mutex mutex = OVS_MUTEX_INITIALIZER;
 static struct classifier cls;
+
+/* By default, use the system routing table.  For system-independent testing,
+ * the unit tests disable using the system routing table. */
+static bool use_system_routing_table = true;
 
 struct ovs_router_entry {
     struct cls_rule cr;
@@ -57,16 +66,22 @@ struct ovs_router_entry {
     struct in6_addr src_addr;
     uint8_t plen;
     uint8_t priority;
+    bool local;
+    uint32_t mark;
 };
 
 static struct ovs_router_entry *
 ovs_router_entry_cast(const struct cls_rule *cr)
 {
-    if (offsetof(struct ovs_router_entry, cr) == 0) {
-        return CONTAINER_OF(cr, struct ovs_router_entry, cr);
-    } else {
-        return cr ? CONTAINER_OF(cr, struct ovs_router_entry, cr) : NULL;
-    }
+    return cr ? CONTAINER_OF(cr, struct ovs_router_entry, cr) : NULL;
+}
+
+/* Disables obtaining routes from the system routing table, for testing
+ * purposes. */
+void
+ovs_router_disable_system_routing_table(void)
+{
+    use_system_routing_table = false;
 }
 
 static bool
@@ -75,7 +90,8 @@ ovs_router_lookup_fallback(const struct in6_addr *ip6_dst, char output_bridge[],
 {
     ovs_be32 src;
 
-    if (!route_table_fallback_lookup(ip6_dst, output_bridge, gw6)) {
+    if (!use_system_routing_table
+        || !route_table_fallback_lookup(ip6_dst, output_bridge, gw6)) {
         return false;
     }
     if (netdev_get_in4_by_name(output_bridge, (struct in_addr *)&src)) {
@@ -88,11 +104,27 @@ ovs_router_lookup_fallback(const struct in6_addr *ip6_dst, char output_bridge[],
 }
 
 bool
-ovs_router_lookup(const struct in6_addr *ip6_dst, char output_bridge[],
+ovs_router_lookup(uint32_t mark, const struct in6_addr *ip6_dst,
+                  char output_bridge[],
                   struct in6_addr *src, struct in6_addr *gw)
 {
     const struct cls_rule *cr;
-    struct flow flow = {.ipv6_dst = *ip6_dst};
+    struct flow flow = {.ipv6_dst = *ip6_dst, .pkt_mark = mark};
+
+    if (src && ipv6_addr_is_set(src)) {
+        const struct cls_rule *cr_src;
+        struct flow flow_src = {.ipv6_dst = *src, .pkt_mark = mark};
+
+        cr_src = classifier_lookup(&cls, OVS_VERSION_MAX, &flow_src, NULL);
+        if (cr_src) {
+            struct ovs_router_entry *p_src = ovs_router_entry_cast(cr_src);
+            if (!p_src->local) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
 
     cr = classifier_lookup(&cls, OVS_VERSION_MAX, &flow, NULL);
     if (cr) {
@@ -100,7 +132,7 @@ ovs_router_lookup(const struct in6_addr *ip6_dst, char output_bridge[],
 
         ovs_strlcpy(output_bridge, p->output_bridge, IFNAMSIZ);
         *gw = p->gw;
-        if (src) {
+        if (src && !ipv6_addr_is_set(src)) {
             *src = p->src_addr;
         }
         return true;
@@ -115,7 +147,8 @@ rt_entry_free(struct ovs_router_entry *p)
     free(p);
 }
 
-static void rt_init_match(struct match *match, const struct in6_addr *ip6_dst,
+static void rt_init_match(struct match *match, uint32_t mark,
+                          const struct in6_addr *ip6_dst,
                           uint8_t plen)
 {
     struct in6_addr dst;
@@ -127,6 +160,8 @@ static void rt_init_match(struct match *match, const struct in6_addr *ip6_dst,
     memset(match, 0, sizeof *match);
     match->flow.ipv6_dst = dst;
     match->wc.masks.ipv6_dst = mask;
+    match->wc.masks.pkt_mark = UINT32_MAX;
+    match->flow.pkt_mark = mark;
 }
 
 static int
@@ -178,7 +213,8 @@ out:
 }
 
 static int
-ovs_router_insert__(uint8_t priority, const struct in6_addr *ip6_dst,
+ovs_router_insert__(uint32_t mark, uint8_t priority, bool local,
+                    const struct in6_addr *ip6_dst,
                     uint8_t plen, const char output_bridge[],
                     const struct in6_addr *gw)
 {
@@ -187,19 +223,29 @@ ovs_router_insert__(uint8_t priority, const struct in6_addr *ip6_dst,
     struct match match;
     int err;
 
-    rt_init_match(&match, ip6_dst, plen);
+    rt_init_match(&match, mark, ip6_dst, plen);
 
     p = xzalloc(sizeof *p);
     ovs_strlcpy(p->output_bridge, output_bridge, sizeof p->output_bridge);
     if (ipv6_addr_is_set(gw)) {
         p->gw = *gw;
     }
+    p->mark = mark;
     p->nw_addr = match.flow.ipv6_dst;
     p->plen = plen;
+    p->local = local;
     p->priority = priority;
     err = get_src_addr(ip6_dst, output_bridge, &p->src_addr);
+    if (err && ipv6_addr_is_set(gw)) {
+        err = get_src_addr(gw, output_bridge, &p->src_addr);
+    }
     if (err) {
+        struct ds ds = DS_EMPTY_INITIALIZER;
+
+        ipv6_format_mapped(ip6_dst, &ds);
+        VLOG_DBG_RL(&rl, "src addr not available for route %s", ds_cstr(&ds));
         free(p);
+        ds_destroy(&ds);
         return err;
     }
     /* Longest prefix matches first. */
@@ -219,37 +265,36 @@ ovs_router_insert__(uint8_t priority, const struct in6_addr *ip6_dst,
 }
 
 void
-ovs_router_insert(const struct in6_addr *ip_dst, uint8_t plen,
-                  const char output_bridge[], const struct in6_addr *gw)
+ovs_router_insert(uint32_t mark, const struct in6_addr *ip_dst, uint8_t plen,
+                  bool local, const char output_bridge[], 
+                  const struct in6_addr *gw)
 {
-    ovs_router_insert__(plen, ip_dst, plen, output_bridge, gw);
+    if (use_system_routing_table) {
+        uint8_t priority = local ? plen + 64 : plen;
+        ovs_router_insert__(mark, priority, local, ip_dst, plen, output_bridge, gw);
+    }
 }
 
-
-static bool
-__rt_entry_delete(const struct cls_rule *cr)
+static void
+rt_entry_delete__(const struct cls_rule *cr)
 {
     struct ovs_router_entry *p = ovs_router_entry_cast(cr);
 
     tnl_port_map_delete_ipdev(p->output_bridge);
-    /* Remove it. */
-    cr = classifier_remove(&cls, cr);
-    if (cr) {
-        ovsrcu_postpone(rt_entry_free, ovs_router_entry_cast(cr));
-        return true;
-    }
-    return false;
+    classifier_remove_assert(&cls, cr);
+    ovsrcu_postpone(rt_entry_free, ovs_router_entry_cast(cr));
 }
 
 static bool
-rt_entry_delete(uint8_t priority, const struct in6_addr *ip6_dst, uint8_t plen)
+rt_entry_delete(uint32_t mark, uint8_t priority,
+                const struct in6_addr *ip6_dst, uint8_t plen)
 {
     const struct cls_rule *cr;
     struct cls_rule rule;
     struct match match;
     bool res = false;
 
-    rt_init_match(&match, ip6_dst, plen);
+    rt_init_match(&match, mark, ip6_dst, plen);
 
     cls_rule_init(&rule, &match, priority);
 
@@ -257,9 +302,13 @@ rt_entry_delete(uint8_t priority, const struct in6_addr *ip6_dst, uint8_t plen)
     cr = classifier_find_rule_exactly(&cls, &rule, OVS_VERSION_MAX);
     if (cr) {
         ovs_mutex_lock(&mutex);
-        res = __rt_entry_delete(cr);
+        rt_entry_delete__(cr);
         ovs_mutex_unlock(&mutex);
+
+        res = true;
     }
+
+    cls_rule_destroy(&rule);
     return res;
 }
 
@@ -289,34 +338,50 @@ static void
 ovs_router_add(struct unixctl_conn *conn, int argc,
               const char *argv[], void *aux OVS_UNUSED)
 {
-    ovs_be32 ip;
-    unsigned int plen;
+    struct in6_addr gw6 = in6addr_any;
     struct in6_addr ip6;
-    struct in6_addr gw6;
+    uint32_t mark = 0;
+    unsigned int plen;
+    ovs_be32 ip;
     int err;
 
     if (scan_ipv4_route(argv[1], &ip, &plen)) {
         ovs_be32 gw = 0;
-        if (argc > 3 && !ip_parse(argv[3], &gw)) {
-            unixctl_command_reply_error(conn, "Invalid gateway");
-            return;
+
+        if (argc > 3) {
+            if (!ovs_scan(argv[3], "pkt_mark=%"SCNi32, &mark) &&
+                !ip_parse(argv[3], &gw)) {
+                unixctl_command_reply_error(conn, "Invalid pkt_mark or gateway");
+                return;
+            }
         }
         in6_addr_set_mapped_ipv4(&ip6, ip);
-        in6_addr_set_mapped_ipv4(&gw6, gw);
+        if (gw) {
+            in6_addr_set_mapped_ipv4(&gw6, gw);
+        }
         plen += 96;
     } else if (scan_ipv6_route(argv[1], &ip6, &plen)) {
-        gw6 = in6addr_any;
-        if (argc > 3 && !ipv6_parse(argv[3], &gw6)) {
-            unixctl_command_reply_error(conn, "Invalid IPv6 gateway");
-            return;
+        if (argc > 3) {
+            if (!ovs_scan(argv[3], "pkt_mark=%"SCNi32, &mark) &&
+                !ipv6_parse(argv[3], &gw6)) {
+                unixctl_command_reply_error(conn, "Invalid pkt_mark or IPv6 gateway");
+                return;
+            }
         }
     } else {
         unixctl_command_reply_error(conn, "Invalid parameters");
         return;
     }
-    err = ovs_router_insert__(plen + 32, &ip6, plen, argv[2], &gw6);
+    if (argc > 4) {
+        if (!ovs_scan(argv[4], "pkt_mark=%"SCNi32, &mark)) {
+            unixctl_command_reply_error(conn, "Invalid pkt_mark");
+            return;
+        }
+    }
+
+    err = ovs_router_insert__(mark, plen + 32, false, &ip6, plen, argv[2], &gw6);
     if (err) {
-        unixctl_command_reply(conn, "Error while inserting route.");
+        unixctl_command_reply_error(conn, "Error while inserting route.");
     } else {
         unixctl_command_reply(conn, "OK");
     }
@@ -326,9 +391,10 @@ static void
 ovs_router_del(struct unixctl_conn *conn, int argc OVS_UNUSED,
               const char *argv[], void *aux OVS_UNUSED)
 {
-    ovs_be32 ip;
-    unsigned int plen;
     struct in6_addr ip6;
+    uint32_t mark = 0;
+    unsigned int plen;
+    ovs_be32 ip;
 
     if (scan_ipv4_route(argv[1], &ip, &plen)) {
         in6_addr_set_mapped_ipv4(&ip6, ip);
@@ -337,7 +403,14 @@ ovs_router_del(struct unixctl_conn *conn, int argc OVS_UNUSED,
         unixctl_command_reply_error(conn, "Invalid parameters");
         return;
     }
-    if (rt_entry_delete(plen + 32, &ip6, plen)) {
+    if (argc > 2) {
+        if (!ovs_scan(argv[2], "pkt_mark=%"SCNi32, &mark)) {
+            unixctl_command_reply_error(conn, "Invalid pkt_mark");
+            return;
+        }
+    }
+
+    if (rt_entry_delete(mark, plen + 32, &ip6, plen)) {
         unixctl_command_reply(conn, "OK");
         seq_change(tnl_conf_seq);
     } else {
@@ -355,7 +428,7 @@ ovs_router_show(struct unixctl_conn *conn, int argc OVS_UNUSED,
     ds_put_format(&ds, "Route Table:\n");
     CLS_FOR_EACH(rt, cr, &cls) {
         uint8_t plen;
-        if (rt->priority == rt->plen) {
+        if (rt->priority == rt->plen || rt->local) {
             ds_put_format(&ds, "Cached: ");
         } else {
             ds_put_format(&ds, "User: ");
@@ -365,13 +438,21 @@ ovs_router_show(struct unixctl_conn *conn, int argc OVS_UNUSED,
         if (IN6_IS_ADDR_V4MAPPED(&rt->nw_addr)) {
             plen -= 96;
         }
-        ds_put_format(&ds, "/%"PRIu16" dev %s", plen, rt->output_bridge);
+        ds_put_format(&ds, "/%"PRIu8, plen);
+        if (rt->mark) {
+            ds_put_format(&ds, " MARK %"PRIu32, rt->mark);
+        }
+
+        ds_put_format(&ds, " dev %s", rt->output_bridge);
         if (ipv6_addr_is_set(&rt->gw)) {
             ds_put_format(&ds, " GW ");
             ipv6_format_mapped(&rt->gw, &ds);
         }
         ds_put_format(&ds, " SRC ");
         ipv6_format_mapped(&rt->src_addr, &ds);
+        if (rt->local) {
+            ds_put_format(&ds, " local");
+        }
         ds_put_format(&ds, "\n");
     }
     unixctl_command_reply(conn, ds_cstr(&ds));
@@ -379,14 +460,15 @@ ovs_router_show(struct unixctl_conn *conn, int argc OVS_UNUSED,
 }
 
 static void
-ovs_router_lookup_cmd(struct unixctl_conn *conn, int argc OVS_UNUSED,
+ovs_router_lookup_cmd(struct unixctl_conn *conn, int argc,
                       const char *argv[], void *aux OVS_UNUSED)
 {
-    ovs_be32 ip;
+    struct in6_addr gw, src = in6addr_any;
+    char iface[IFNAMSIZ];
     struct in6_addr ip6;
     unsigned int plen;
-    char iface[IFNAMSIZ];
-    struct in6_addr gw, src;
+    uint32_t mark = 0;
+    ovs_be32 ip;
 
     if (scan_ipv4_route(argv[1], &ip, &plen) && plen == 32) {
         in6_addr_set_mapped_ipv4(&ip6, ip);
@@ -394,12 +476,18 @@ ovs_router_lookup_cmd(struct unixctl_conn *conn, int argc OVS_UNUSED,
         unixctl_command_reply_error(conn, "Invalid parameters");
         return;
     }
-
-    if (ovs_router_lookup(&ip6, iface, &src, &gw)) {
+    if (argc > 2) {
+        if (!ovs_scan(argv[2], "pkt_mark=%"SCNi32, &mark)) {
+            unixctl_command_reply_error(conn, "Invalid pkt_mark");
+            return;
+        }
+    }
+    if (ovs_router_lookup(mark, &ip6, iface, &src, &gw)) {
         struct ds ds = DS_EMPTY_INITIALIZER;
+
         ds_put_format(&ds, "src ");
         ipv6_format_mapped(&src, &ds);
-        ds_put_format(&ds, "gateway ");
+        ds_put_format(&ds, "\ngateway ");
         ipv6_format_mapped(&gw, &ds);
         ds_put_format(&ds, "\ndev %s\n", iface);
         unixctl_command_reply(conn, ds_cstr(&ds));
@@ -418,7 +506,7 @@ ovs_router_flush(void)
     classifier_defer(&cls);
     CLS_FOR_EACH(rt, cr, &cls) {
         if (rt->priority == rt->plen) {
-            __rt_entry_delete(&rt->cr);
+            rt_entry_delete__(&rt->cr);
         }
     }
     classifier_publish(&cls);
@@ -426,16 +514,32 @@ ovs_router_flush(void)
     seq_change(tnl_conf_seq);
 }
 
-/* May not be called more than once. */
+static void
+ovs_router_flush_handler(void *aux OVS_UNUSED)
+{
+    ovs_router_flush();
+}
+
 void
 ovs_router_init(void)
 {
-    classifier_init(&cls, NULL);
-    unixctl_command_register("ovs/route/add", "ip_addr/prefix_len out_br_name gw", 2, 3,
-                             ovs_router_add, NULL);
-    unixctl_command_register("ovs/route/show", "", 0, 0, ovs_router_show, NULL);
-    unixctl_command_register("ovs/route/del", "ip_addr/prefix_len", 1, 1, ovs_router_del,
-                             NULL);
-    unixctl_command_register("ovs/route/lookup", "ip_addr", 1, 1,
-                             ovs_router_lookup_cmd, NULL);
+    static struct ovsthread_once once = OVSTHREAD_ONCE_INITIALIZER;
+
+    if (ovsthread_once_start(&once)) {
+        fatal_signal_add_hook(ovs_router_flush_handler, NULL, NULL, true);
+        classifier_init(&cls, NULL);
+        unixctl_command_register("ovs/route/add",
+                                 "ip_addr/prefix_len out_br_name [gw] "
+                                 "[pkt_mark=mark]",
+                                 2, 4, ovs_router_add, NULL);
+        unixctl_command_register("ovs/route/show", "", 0, 0,
+                                 ovs_router_show, NULL);
+        unixctl_command_register("ovs/route/del", "ip_addr/prefix_len "
+                                 "[pkt_mark=mark]", 1, 2, ovs_router_del,
+                                 NULL);
+        unixctl_command_register("ovs/route/lookup", "ip_addr "
+                                 "[pkt_mark=mark]", 1, 2,
+                                 ovs_router_lookup_cmd, NULL);
+        ovsthread_once_done(&once);
+    }
 }

@@ -1,4 +1,4 @@
-# Copyright (c) 2009, 2010, 2011, 2012 Nicira, Inc.
+# Copyright (c) 2009, 2010, 2011, 2012, 2016 Nicira, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,20 +15,22 @@
 from __future__ import print_function
 
 import getopt
-import re
 import os
+import re
 import sys
 import uuid
 
-from ovs.db import error
 import ovs.db.idl
 import ovs.db.schema
-from ovs.db import data
 import ovs.db.types
 import ovs.ovsuuid
 import ovs.poller
+import ovs.stream
 import ovs.util
+from ovs.db import data
+from ovs.db import error
 from ovs.fatal_signal import signal_alarm
+
 import six
 
 
@@ -149,14 +151,15 @@ def do_parse_schema(schema_string):
     print(ovs.json.to_string(schema.to_json(), sort_keys=True))
 
 
-def get_simple_table_printable_row(row):
-    simple_columns = ["i", "r", "b", "s", "u", "ia",
-                      "ra", "ba", "sa", "ua", "uuid"]
+def get_simple_printable_row_string(row, columns):
     s = ""
-    for column in simple_columns:
+    for column in columns:
         if hasattr(row, column) and not (type(getattr(row, column))
                                          is ovs.db.data.Atom):
-            s += "%s=%s " % (column, getattr(row, column))
+            value = getattr(row, column)
+            if isinstance(value, dict):
+                value = sorted(value.items())
+            s += "%s=%s " % (column, value)
     s = s.strip()
     s = re.sub('""|,|u?\'', "", s)
     s = re.sub('UUID\(([^)]+)\)', r'\1', s)
@@ -166,6 +169,22 @@ def get_simple_table_printable_row(row):
     return s
 
 
+def get_simple_table_printable_row(row):
+    simple_columns = ["i", "r", "b", "s", "u", "ia",
+                      "ra", "ba", "sa", "ua", "uuid"]
+    return get_simple_printable_row_string(row, simple_columns)
+
+
+def get_simple2_table_printable_row(row):
+    simple2_columns = ["name", "smap", "imap"]
+    return get_simple_printable_row_string(row, simple2_columns)
+
+
+def get_simple3_table_printable_row(row):
+    simple3_columns = ["name", "uset"]
+    return get_simple_printable_row_string(row, simple3_columns)
+
+
 def print_idl(idl, step):
     n = 0
     if "simple" in idl.tables:
@@ -173,6 +192,22 @@ def print_idl(idl, step):
         for row in six.itervalues(simple):
             s = "%03d: " % step
             s += get_simple_table_printable_row(row)
+            print(s)
+            n += 1
+
+    if "simple2" in idl.tables:
+        simple2 = idl.tables["simple2"].rows
+        for row in six.itervalues(simple2):
+            s = "%03d: " % step
+            s += get_simple2_table_printable_row(row)
+            print(s)
+            n += 1
+
+    if "simple3" in idl.tables:
+        simple3 = idl.tables["simple3"].rows
+        for row in six.itervalues(simple3):
+            s = "%03d: " % step
+            s += get_simple3_table_printable_row(row)
             print(s)
             n += 1
 
@@ -246,6 +281,17 @@ def idltest_find_simple(idl, i):
     return None
 
 
+def idltest_find_simple2(idl, i):
+    for row in six.itervalues(idl.tables["simple2"].rows):
+        if row.name == i:
+            return row
+    return None
+
+
+def idltest_find_simple3(idl, i):
+    return next(idl.index_equal("simple3", "simple3_by_name", i), None)
+
+
 def idl_set(idl, commands, step):
     txn = ovs.db.idl.Transaction(idl)
     increment = False
@@ -285,7 +331,12 @@ def idl_set(idl, commands, step):
             if args[1] == "b":
                 s.b = args[2] == "1"
             elif args[1] == "s":
-                s.s = args[2]
+                if six.PY2:
+                    s.s = args[2].decode('utf-8')
+                else:
+                    s.s = args[2].encode(sys.getfilesystemencoding(),
+                                         'surrogateescape') \
+                                 .decode('utf-8', 'replace')
             elif args[1] == "u":
                 s.u = uuid.UUID(args[2])
             elif args[1] == "r":
@@ -381,6 +432,90 @@ def idl_set(idl, commands, step):
             i = getattr(l1, 'i', 1)
             assert i == 2
             l1.k = [l1]
+        elif name == 'partialmapinsertelement':
+            row = idltest_find_simple2(idl, 'myString1')
+            len_smap = len(getattr(row, 'smap'))
+            row.setkey('smap', 'key1', 'myList1')
+            len_imap = len(getattr(row, 'imap'))
+            row.setkey('imap', 3, 'myids2')
+            row.__setattr__('name', 'String2')
+            assert len(getattr(row, 'smap')) == len_smap
+            assert len(getattr(row, 'imap')) == len_imap + 1
+        elif name == 'partialmapinsertmultipleelements':
+            row = idltest_find_simple2(idl, 'String2')
+            len_smap = len(getattr(row, 'smap'))
+            row.setkey('smap', 'key2', 'myList2')
+            row.setkey('smap', 'key3', 'myList3')
+            row.setkey('smap', 'key4', 'myList4')
+            assert len(getattr(row, 'smap')) == len_smap + 2
+        elif name == 'partialmapdelelements':
+            row = idltest_find_simple2(idl, 'String2')
+            len_smap = len(getattr(row, 'smap'))
+            row.delkey('smap', 'key1', 'myList1')
+            row.delkey('smap', 'key2', 'wrongvalue')
+            row.delkey('smap', 'key3')
+            row.delkey('smap', 'key4')
+            assert len(getattr(row, 'smap')) == len_smap - 3
+        elif name == 'partialmapmutatenew':
+            new_row2 = txn.insert(idl.tables["simple2"])
+            setattr(new_row2, 'name', 'String2New')
+            new_row2.setkey('smap', 'key1', 'newList1')
+            assert len(getattr(new_row2, 'smap')) == 1
+            new_row2.setkey('smap', 'key2', 'newList2')
+            assert len(getattr(new_row2, 'smap')) == 2
+        elif name == 'partialrenamesetadd':
+            row = idltest_find_simple3(idl, 'mySet1')
+            old_size = len(getattr(row, 'uset', []))
+            row.addvalue('uset',
+                         uuid.UUID("001e43d2-dd3f-4616-ab6a-83a490bb0991"))
+            row.__setattr__('name', 'String2')
+            assert len(getattr(row, 'uset', [])) == old_size + 1
+        elif name == 'partialduplicateadd':
+            row = idltest_find_simple3(idl, 'String2')
+            old_size = len(getattr(row, 'uset', []))
+            row.addvalue('uset',
+                         uuid.UUID("0026b3ba-571b-4729-8227-d860a5210ab8"))
+            row.addvalue('uset',
+                         uuid.UUID("0026b3ba-571b-4729-8227-d860a5210ab8"))
+            assert len(getattr(row, 'uset', [])) == old_size + 1
+        elif name == 'partialsetdel':
+            row = idltest_find_simple3(idl, 'String2')
+            old_size = len(getattr(row, 'uset', []))
+            row.delvalue('uset',
+                         uuid.UUID("001e43d2-dd3f-4616-ab6a-83a490bb0991"))
+            assert len(getattr(row, 'uset', [])) == old_size - 1
+        elif name == 'partialsetref':
+            new_row = txn.insert(idl.tables["simple4"])
+            new_row.__setattr__('name', 'test')
+            row = idltest_find_simple3(idl, 'String2')
+            old_size = len(getattr(row, 'uref', []))
+            row.addvalue('uref', new_row.uuid)
+            assert len(getattr(row, 'uref', [])) == old_size + 1
+        elif name == 'partialsetoverrideops':
+            row = idltest_find_simple3(idl, 'String2')
+            row.addvalue('uset',
+                         uuid.UUID("579e978d-776c-4f19-a225-268e5890e670"))
+            row.delvalue('uset',
+                         uuid.UUID("0026b3ba-571b-4729-8227-d860a5210ab8"))
+            row.__setattr__('uset',
+                [uuid.UUID("0026b3ba-571b-4729-8227-d860a5210ab8")])
+            assert len(getattr(row, 'uset', [])) == 1
+        elif name == 'partialsetadddelete':
+            row = idltest_find_simple3(idl, 'String2')
+            row.addvalue('uset',
+                         uuid.UUID('b6272353-af9c-40b7-90fe-32a43e6518a1'))
+            row.addvalue('uset',
+                         uuid.UUID('1d6a71a2-dffb-426e-b2fa-b727091f9901'))
+            row.delvalue('uset',
+                         uuid.UUID('0026b3ba-571b-4729-8227-d860a5210ab8'))
+            assert len(getattr(row, 'uset', [])) == 2
+        elif name == 'partialsetmutatenew':
+            new_row41 = txn.insert(idl.tables["simple4"])
+            new_row41.__setattr__('name', 'new_row41')
+            new_row3 = txn.insert(idl.tables["simple3"])
+            setattr(new_row3, 'name', 'String3')
+            new_row3.addvalue('uset', new_row41.uuid)
+            assert len(getattr(new_row3, 'uset', [])) == 1
         else:
             sys.stderr.write("unknown command %s\n" % name)
             sys.exit(1)
@@ -399,30 +534,33 @@ def idl_set(idl, commands, step):
 
 
 def update_condition(idl, commands):
-    commands = commands.split(";")
+    commands = commands[len("condition "):].split(";")
     for command in commands:
-        command = command[len("condition "):]
-        if "add" in command:
-            add_cmd = True
-            command = command[len("add "):]
-        else:
-            add_cmd = False
-            command = command[len("remove "):]
-
         command = command.split(" ")
         if(len(command) != 2):
-            sys.stderr.write("Error parsong condition %s\n" % command)
+            sys.stderr.write("Error parsing condition %s\n" % command)
             sys.exit(1)
 
         table = command[0]
         cond = ovs.json.from_string(command[1])
 
-        idl.cond_change(table, add_cmd, cond)
+        idl.cond_change(table, cond)
 
 
 def do_idl(schema_file, remote, *commands):
     schema_helper = ovs.db.idl.SchemaHelper(schema_file)
     track_notify = False
+
+    if remote.startswith("ssl:"):
+        if len(commands) < 3:
+            sys.stderr.write("SSL connection requires private key, "
+                             "certificate for private key, and peer CA "
+                             "certificate as arguments\n")
+            sys.exit(1)
+        ovs.stream.Stream.ssl_set_private_key_file(commands[0])
+        ovs.stream.Stream.ssl_set_certificate_file(commands[1])
+        ovs.stream.Stream.ssl_set_ca_cert_file(commands[2])
+        commands = commands[3:]
 
     if commands and commands[0] == "track-notify":
         commands = commands[1:]
@@ -443,6 +581,8 @@ def do_idl(schema_file, remote, *commands):
     else:
         schema_helper.register_all()
     idl = ovs.db.idl.Idl(remote, schema_helper)
+    if "simple3" in idl.tables:
+        idl.index_create("simple3", "simple3_by_name")
 
     if commands:
         error, stream = ovs.stream.Stream.open_block(
@@ -713,7 +853,7 @@ def main(argv):
             sys.stderr.write("%s: \"%s\" requires at least %d arguments but "
                              "only %d provided\n"
                              % (ovs.util.PROGRAM_NAME, command_name,
-                                n_args, len(args)))
+                                n_args[0], len(args)))
             sys.exit(1)
     elif type(n_args) == int:
         if len(args) != n_args:

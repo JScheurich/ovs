@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015 Nicira, Inc.
+ * Copyright (c) 2015, 2017 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -41,13 +41,11 @@
 
 VLOG_DEFINE_THIS_MODULE(ovsdb_monitor);
 
-static const struct ovsdb_replica_class ovsdb_jsonrpc_replica_class;
 static struct hmap ovsdb_monitors = HMAP_INITIALIZER(&ovsdb_monitors);
 
 /* Keep state of session's conditions */
 struct ovsdb_monitor_session_condition {
-    bool conditional;
-    size_t n_true_cnd;
+    bool conditional;        /* True iff every table's condition is true. */
     struct shash tables;     /* Contains
                               *   "struct ovsdb_monitor_table_condition *"s. */
 };
@@ -67,7 +65,7 @@ struct ovsdb_monitor_table_condition {
 
 /* A collection of tables being monitored. */
 struct ovsdb_monitor {
-    struct ovsdb_replica replica;
+    struct ovs_list list_node;  /* In struct ovsdb's "monitors" list. */
     struct shash tables;     /* Holds "struct ovsdb_monitor_table"s. */
     struct ovs_list jsonrpc_monitors;  /* Contains "jsonrpc_monitor_node"s. */
     struct ovsdb *db;
@@ -86,8 +84,8 @@ struct ovsdb_monitor_json_cache_node {
 };
 
 struct jsonrpc_monitor_node {
-    struct ovsdb_jsonrpc_monitor *jsonrpc_monitor;
     struct ovs_list node;
+    struct ovsdb_jsonrpc_monitor *jsonrpc_monitor;
 };
 
 /* A particular column being monitored. */
@@ -116,12 +114,12 @@ struct ovsdb_monitor_row {
  * 'transaction' stores the first update's transaction id.
  * */
 struct ovsdb_monitor_changes {
+    struct hmap_node hmap_node;  /* Element in ovsdb_monitor_tables' changes
+                                    hmap.  */
     struct ovsdb_monitor_table *mt;
     struct hmap rows;
     int n_refs;
     uint64_t transaction;
-    struct hmap_node hmap_node;  /* Element in ovsdb_monitor_tables' changes
-                                    hmap.  */
 };
 
 /* A particular table being monitored. */
@@ -238,13 +236,6 @@ compare_ovsdb_monitor_column(const void *a_, const void *b_)
     }
 
     return a->column < b->column ? -1 : a->column > b->column;
-}
-
-static struct ovsdb_monitor *
-ovsdb_monitor_cast(struct ovsdb_replica *replica)
-{
-    ovs_assert(replica->class == &ovsdb_jsonrpc_replica_class);
-    return CONTAINER_OF(replica, struct ovsdb_monitor, replica);
 }
 
 /* Finds and returns the ovsdb_monitor_row in 'mt->changes->rows' for the
@@ -381,8 +372,7 @@ ovsdb_monitor_create(struct ovsdb *db,
 
     dbmon = xzalloc(sizeof *dbmon);
 
-    ovsdb_replica_init(&dbmon->replica, &ovsdb_jsonrpc_replica_class);
-    ovsdb_add_replica(db, &dbmon->replica);
+    ovs_list_push_back(&db->monitors, &dbmon->list_node);
     ovs_list_init(&dbmon->jsonrpc_monitors);
     dbmon->db = db;
     dbmon->n_transactions = 0;
@@ -583,8 +573,17 @@ static inline void
 ovsdb_monitor_session_condition_set_mode(
                                   struct ovsdb_monitor_session_condition *cond)
 {
-    cond->conditional = shash_count(&cond->tables) !=
-        cond->n_true_cnd;
+    struct shash_node *node;
+
+    SHASH_FOR_EACH (node, &cond->tables) {
+        struct ovsdb_monitor_table_condition *mtc = node->data;
+
+        if (!ovsdb_condition_is_true(&mtc->new_condition)) {
+            cond->conditional = true;
+            return;
+        }
+    }
+    cond->conditional = false;
 }
 
 /* Returnes an empty allocated session's condition state holder */
@@ -649,10 +648,7 @@ ovsdb_monitor_table_condition_create(
     shash_add(&condition->tables, table->schema->name, mtc);
     /* On session startup old == new condition */
     ovsdb_condition_clone(&mtc->new_condition, &mtc->old_condition);
-    if (ovsdb_condition_is_true(&mtc->old_condition)) {
-        condition->n_true_cnd++;
-        ovsdb_monitor_session_condition_set_mode(condition);
-    }
+    ovsdb_monitor_session_condition_set_mode(condition);
 
     return NULL;
 }
@@ -687,14 +683,14 @@ ovsdb_monitor_table_condition_update(
                             const struct ovsdb_table *table,
                             const struct json *cond_json)
 {
+    if (!condition) {
+        return NULL;
+    }
+
     struct ovsdb_monitor_table_condition *mtc =
         shash_find_data(&condition->tables, table->schema->name);
     struct ovsdb_error *error;
     struct ovsdb_condition cond = OVSDB_CONDITION_INITIALIZER(&cond);
-
-    if (!condition) {
-        return NULL;
-    }
 
     error = ovsdb_condition_from_json(table->schema, cond_json,
                                       NULL, &cond);
@@ -722,15 +718,6 @@ ovsdb_monitor_table_condition_updated(struct ovsdb_monitor_table *mt,
         /* If conditional monitoring - set old condition to new condition */
         if (ovsdb_condition_cmp_3way(&mtc->old_condition,
                                      &mtc->new_condition)) {
-            if (ovsdb_condition_is_true(&mtc->new_condition)) {
-				if (!ovsdb_condition_is_true(&mtc->old_condition)) {
-                    condition->n_true_cnd++;
-                }
-            } else {
-                if (ovsdb_condition_is_true(&mtc->old_condition)) {
-                    condition->n_true_cnd--;
-                }
-            }
             ovsdb_condition_destroy(&mtc->old_condition);
             ovsdb_condition_clone(&mtc->old_condition, &mtc->new_condition);
             ovsdb_monitor_session_condition_set_mode(condition);
@@ -1042,17 +1029,17 @@ ovsdb_monitor_compose_update(
             continue;
         }
 
-		HMAP_FOR_EACH_SAFE (row, next, hmap_node, &changes->rows) {
-			struct json *row_json;
-			row_json = (*row_update)(mt, condition, OVSDB_MONITOR_ROW, row,
-									 initial, changed);
-			if (row_json) {
-				ovsdb_monitor_add_json_row(&json, mt->table->schema->name,
-										   &table_json, row_json,
-										   &row->uuid);
-			}
-		}
-	}
+        HMAP_FOR_EACH_SAFE (row, next, hmap_node, &changes->rows) {
+            struct json *row_json;
+            row_json = (*row_update)(mt, condition, OVSDB_MONITOR_ROW, row,
+                                     initial, changed);
+            if (row_json) {
+                ovsdb_monitor_add_json_row(&json, mt->table->schema->name,
+                                           &table_json, row_json,
+                                           &row->uuid);
+            }
+        }
+    }
     free(changed);
 
     return json;
@@ -1145,21 +1132,21 @@ ovsdb_monitor_get_update(
         } else {
             ovs_assert(version == OVSDB_MONITOR_V2);
             if (!cond_updated) {
-				json = ovsdb_monitor_compose_update(dbmon, initial, unflushed,
-											condition,
-											ovsdb_monitor_compose_row_update2);
+                json = ovsdb_monitor_compose_update(dbmon, initial, unflushed,
+                                            condition,
+                                            ovsdb_monitor_compose_row_update2);
 
-				if (!condition || !condition->conditional) {
-					ovsdb_monitor_json_cache_insert(dbmon, version, unflushed,
-													json);
-				}
-			} else {
+                if (!condition || !condition->conditional) {
+                    ovsdb_monitor_json_cache_insert(dbmon, version, unflushed,
+                                                    json);
+                }
+            } else {
                 /* Compose update on whole db due to condition update.
                    Session must be flushed (change list is empty)*/
-				json =
-					ovsdb_monitor_compose_cond_change_update(dbmon, condition);
-			}
-		}
+                json =
+                    ovsdb_monitor_compose_cond_change_update(dbmon, condition);
+            }
+        }
     }
 
     /* Maintain transaction id of 'changes'. */
@@ -1252,7 +1239,46 @@ ovsdb_monitor_changes_update(const struct ovsdb_row *old,
         change->new = clone_monitor_row_data(mt, new);
     } else {
         if (new) {
-            update_monitor_row_data(mt, new, change->new);
+            if (!change->new) {
+                /* Reinsert the row that was just deleted.
+                 *
+                 * This path won't be hit without replication.  Whenever OVSDB
+                 * server inserts a new row, It always generates a new UUID
+                 * that is different from the row just deleted.
+                 *
+                 * With replication, this path can be hit in a corner
+                 * case when two OVSDB servers are set up to replicate
+                 * each other. Not that is a useful set up, but can
+                 * happen in practice.
+                 *
+                 * An example of how this path can be hit is documented below.
+                 * The details is not as important to the correctness of the
+                 * logic, but added here to convince ourselves that this path
+                 * can be hit.
+                 *
+                 * Imagine two OVSDB servers that replicates from each
+                 * other. For each replication session, there is a
+                 * corresponding monitor at the other end of the replication
+                 * JSONRPC connection.
+                 *
+                 * The events can lead to a back to back deletion and
+                 * insertion operation of the same row for the monitor of
+                 * the first server are:
+                 *
+                 * 1. A row is inserted in the first OVSDB server.
+                 * 2. The row is then replicated to the remote OVSDB server.
+                 * 3. The row is now  deleted by the local OVSDB server. This
+                 *    deletion operation is replicated to the local monitor
+                 *    of the OVSDB server.
+                 * 4. The monitor now receives the same row, as an insertion,
+                 *    from the replication server. Because of
+                 *    replication, the row carries the same UUID as the row
+                 *    just deleted.
+                 */
+                change->new = clone_monitor_row_data(mt, new);
+            } else {
+                update_monitor_row_data(mt, new, change->new);
+            }
         } else {
             free_monitor_row_data(mt, change->new);
             change->new = NULL;
@@ -1512,7 +1538,7 @@ ovsdb_monitor_destroy(struct ovsdb_monitor *dbmon)
 {
     struct shash_node *node;
 
-    ovs_list_remove(&dbmon->replica.node);
+    ovs_list_remove(&dbmon->list_node);
 
     if (!hmap_node_is_null(&dbmon->hmap_node)) {
         hmap_remove(&ovsdb_monitors, &dbmon->hmap_node);
@@ -1538,12 +1564,9 @@ ovsdb_monitor_destroy(struct ovsdb_monitor *dbmon)
     free(dbmon);
 }
 
-static struct ovsdb_error *
-ovsdb_monitor_commit(struct ovsdb_replica *replica,
-                     const struct ovsdb_txn *txn,
-                     bool durable OVS_UNUSED)
+static void
+ovsdb_monitor_commit(struct ovsdb_monitor *m, const struct ovsdb_txn *txn)
 {
-    struct ovsdb_monitor *m = ovsdb_monitor_cast(replica);
     struct ovsdb_monitor_aux aux;
 
     ovsdb_monitor_init_aux(&aux, m);
@@ -1566,21 +1589,31 @@ ovsdb_monitor_commit(struct ovsdb_replica *replica,
         ovsdb_monitor_json_cache_flush(m);
         break;
     }
-
-    return NULL;
 }
 
-static void
-ovsdb_monitor_destroy_callback(struct ovsdb_replica *replica)
+void
+ovsdb_monitors_commit(struct ovsdb *db, const struct ovsdb_txn *txn)
 {
-    struct ovsdb_monitor *dbmon = ovsdb_monitor_cast(replica);
-    struct jsonrpc_monitor_node *jm, *next;
+    struct ovsdb_monitor *m;
 
-    /* Delete all front end monitors. Removing the last front
-     * end monitor will also destroy the corresponding 'ovsdb_monitor'.
-     * ovsdb monitor will also be destroied.  */
-    LIST_FOR_EACH_SAFE(jm, next, node, &dbmon->jsonrpc_monitors) {
-        ovsdb_jsonrpc_monitor_destroy(jm->jsonrpc_monitor);
+    LIST_FOR_EACH (m, list_node, &db->monitors) {
+        ovsdb_monitor_commit(m, txn);
+    }
+}
+
+void
+ovsdb_monitors_remove(struct ovsdb *db)
+{
+    struct ovsdb_monitor *m, *next_m;
+
+    LIST_FOR_EACH_SAFE (m, next_m, list_node, &db->monitors) {
+        struct jsonrpc_monitor_node *jm, *next_jm;
+
+        /* Delete all front-end monitors.  Removing the last front-end monitor
+         * will also destroy the corresponding ovsdb_monitor. */
+        LIST_FOR_EACH_SAFE (jm, next_jm, node, &m->jsonrpc_monitors) {
+            ovsdb_jsonrpc_monitor_destroy(jm->jsonrpc_monitor, false);
+        }
     }
 }
 
@@ -1597,7 +1630,18 @@ ovsdb_monitor_get_memory_usage(struct simap *usage)
     }
 }
 
-static const struct ovsdb_replica_class ovsdb_jsonrpc_replica_class = {
-    ovsdb_monitor_commit,
-    ovsdb_monitor_destroy_callback,
-};
+void
+ovsdb_monitor_prereplace_db(struct ovsdb *db)
+{
+    struct ovsdb_monitor *m, *next_m;
+
+    LIST_FOR_EACH_SAFE (m, next_m, list_node, &db->monitors) {
+        struct jsonrpc_monitor_node *jm, *next_jm;
+
+        /* Delete all front-end monitors.  Removing the last front-end monitor
+         * will also destroy the corresponding ovsdb_monitor. */
+        LIST_FOR_EACH_SAFE (jm, next_jm, node, &m->jsonrpc_monitors) {
+            ovsdb_jsonrpc_monitor_destroy(jm->jsonrpc_monitor, true);
+        }
+    }
+}

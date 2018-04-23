@@ -157,17 +157,20 @@ typedef union OvsIPv4TunnelKey {
     uint64_t attr[NUM_PKT_ATTR_REQUIRED];
 } OvsIPv4TunnelKey; /* Size of 280 byte. */
 
-__inline uint8_t TunnelKeyGetOptionsOffset(const OvsIPv4TunnelKey *key)
+static __inline uint8_t
+TunnelKeyGetOptionsOffset(const OvsIPv4TunnelKey *key)
 {
     return TUN_OPT_MAX_LEN - key->tunOptLen;
 }
 
-__inline uint8_t* TunnelKeyGetOptions(OvsIPv4TunnelKey *key)
+static __inline uint8_t *
+TunnelKeyGetOptions(OvsIPv4TunnelKey *key)
 {
     return key->tunOpts + TunnelKeyGetOptionsOffset(key);
 }
 
-__inline uint16_t TunnelKeyGetRealSize(OvsIPv4TunnelKey *key)
+static __inline uint16_t
+TunnelKeyGetRealSize(OvsIPv4TunnelKey *key)
 {
     return sizeof(OvsIPv4TunnelKey) - TunnelKeyGetOptionsOffset(key);
 }
@@ -196,6 +199,7 @@ typedef __declspec(align(8)) struct OvsFlowKey {
         UINT32 mark;
         UINT32 state;
         struct ovs_key_ct_labels labels;
+        struct ovs_key_ct_tuple_ipv4 tuple_ipv4;
     } ct;                        /* Connection Tracking Flags */
 } OvsFlowKey;
 
@@ -295,7 +299,7 @@ typedef struct _OVS_PACKET_INFO {
 typedef struct OvsPacketExecute {
    uint32_t dpNo;
    uint32_t inPort;
-
+   uint16 mru;
    uint32_t packetLen;
    uint32_t actionsLen;
    PNL_MSG_HDR nlMsgHdr;
@@ -332,7 +336,8 @@ enum {
 enum {
     OVS_EVENT_CT_NEW        = (1 << 0),
     OVS_EVENT_CT_DELETE     = (1 << 1),
-    OVS_EVENT_CT_MASK_ALL   = 0x3
+    OVS_EVENT_CT_UPDATE     = (1 << 2),
+    OVS_EVENT_CT_MASK_ALL   = 0x7
 };
 
 /* Supported mcast event groups */

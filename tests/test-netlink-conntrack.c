@@ -23,7 +23,7 @@
 #include "netlink-conntrack.h"
 #include "netlink-notifier.h"
 #include "ovstest.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 
 /* Monitor command */
 struct test_change {
@@ -106,6 +106,7 @@ test_nl_ct_dump(struct ovs_cmdl_context *ctx)
     uint16_t zone, *pzone = NULL;
     struct ct_dpif_entry entry;
     int err;
+    int tot_bkts;
 
     if (ctx->argc >= 2) {
         if (!ovs_scan(ctx->argv[1], "zone=%"SCNu16, &zone)) {
@@ -113,7 +114,7 @@ test_nl_ct_dump(struct ovs_cmdl_context *ctx)
         }
         pzone = &zone;
     }
-    err = nl_ct_dump_start(&dump, pzone);
+    err = nl_ct_dump_start(&dump, pzone, &tot_bkts);
     if (err) {
         ovs_fatal(err, "Error creating conntrack netlink dump");
     }
@@ -161,14 +162,14 @@ static const struct ovs_cmdl_command commands[] = {
     /* Linux netlink connection tracker interface test. */
 
     /* Prints all the entries in the connection table and exits. */
-    {"dump", "[zone=zone]", 0, 1, test_nl_ct_dump},
+    {"dump", "[zone=zone]", 0, 1, test_nl_ct_dump, OVS_RO},
     /* Listens to all the connection tracking events and prints them to
      * standard output until killed. */
-    {"monitor", "", 0, 0, test_nl_ct_monitor},
+    {"monitor", "", 0, 0, test_nl_ct_monitor, OVS_RO},
     /* Flushes all the entries from all the tables.. */
-    {"flush", "[zone=zone]", 0, 1, test_nl_ct_flush},
+    {"flush", "[zone=zone]", 0, 1, test_nl_ct_flush, OVS_RO},
 
-    {NULL, NULL, 0, 0, NULL},
+    {NULL, NULL, 0, 0, NULL, OVS_RO},
 };
 
 static void

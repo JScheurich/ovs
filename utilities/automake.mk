@@ -37,11 +37,9 @@ noinst_SCRIPTS += utilities/ovs-sim
 
 utilities/ovs-lib: $(top_builddir)/config.status
 
-docs += utilities/ovs-command-bashcomp.INSTALL.md
 EXTRA_DIST += \
 	utilities/ovs-appctl-bashcomp.bash \
 	utilities/ovs-check-dead-ifs.in \
-	utilities/ovs-command-bashcomp.INSTALL.md \
 	utilities/ovs-ctl.in \
 	utilities/ovs-dev.py \
 	utilities/ovs-docker \
@@ -58,7 +56,6 @@ EXTRA_DIST += \
 	utilities/ovs-test.in \
 	utilities/ovs-vlan-test.in \
 	utilities/ovs-vsctl-bashcomp.bash \
-	utilities/qemu-wrap.py \
 	utilities/checkpatch.py
 MAN_ROOTS += \
 	utilities/ovs-appctl.8.in \
@@ -74,11 +71,9 @@ MAN_ROOTS += \
 	utilities/ovs-tcpdump.8.in \
 	utilities/ovs-tcpundump.1.in \
 	utilities/ovs-vlan-bug-workaround.8.in \
-	utilities/ovs-test.8.in \
-	utilities/ovs-vlan-test.8.in \
 	utilities/ovs-vsctl.8.in
 MAN_FRAGMENTS += utilities/ovs-vlan-bugs.man
-DISTCLEANFILES += \
+CLEANFILES += \
 	utilities/ovs-appctl.8 \
 	utilities/ovs-ctl \
 	utilities/ovs-check-dead-ifs \
@@ -102,9 +97,7 @@ DISTCLEANFILES += \
 	utilities/ovs-tcpundump \
 	utilities/ovs-tcpundump.1 \
 	utilities/ovs-test \
-	utilities/ovs-test.8 \
 	utilities/ovs-vlan-test \
-	utilities/ovs-vlan-test.8 \
 	utilities/ovs-vlan-bug-workaround.8 \
 	utilities/ovs-vsctl.8
 
@@ -122,8 +115,6 @@ man_MANS += \
 	utilities/ovs-tcpdump.8 \
 	utilities/ovs-tcpundump.1 \
 	utilities/ovs-vlan-bug-workaround.8 \
-	utilities/ovs-test.8 \
-	utilities/ovs-vlan-test.8 \
 	utilities/ovs-vsctl.8
 
 utilities_ovs_appctl_SOURCES = utilities/ovs-appctl.c
@@ -155,6 +146,7 @@ endif
 
 FLAKE8_PYFILES += utilities/ovs-pcap.in \
 	utilities/checkpatch.py utilities/ovs-dev.py \
-	utilities/ovs-tcpdump.in
+	utilities/ovs-tcpdump.in \
+	utilities/ovs-pipegen.py
 
 include utilities/bugtool/automake.mk

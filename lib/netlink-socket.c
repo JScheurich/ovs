@@ -19,6 +19,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <stdlib.h>
+#include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -28,10 +29,11 @@
 #include "openvswitch/hmap.h"
 #include "netlink.h"
 #include "netlink-protocol.h"
+#include "netnsid.h"
 #include "odp-netlink.h"
 #include "openvswitch/ofpbuf.h"
 #include "ovs-thread.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "seq.h"
 #include "socket-util.h"
 #include "util.h"
@@ -60,6 +62,22 @@ static void log_nlmsg(const char *function, int error,
 #ifdef _WIN32
 static int get_sock_pid_from_kernel(struct nl_sock *sock);
 static int set_sock_property(struct nl_sock *sock);
+static int nl_sock_transact(struct nl_sock *sock, const struct ofpbuf *request,
+                            struct ofpbuf **replyp);
+
+/* In the case DeviceIoControl failed and GetLastError returns with
+ * ERROR_NOT_FOUND means we lost communication with the kernel device.
+ * CloseHandle will fail because the handle in 'theory' does not exist.
+ * The only remaining option is to crash and allow the service to be restarted
+ * via service manager.  This is the only way to close the handle from both
+ * userspace and kernel. */
+void
+lost_communication(DWORD last_err)
+{
+    if (last_err == ERROR_NOT_FOUND) {
+        ovs_abort(0, "lost communication with the kernel device");
+    }
+}
 #endif
 
 /* Netlink sockets. */
@@ -278,6 +296,7 @@ get_sock_pid_from_kernel(struct nl_sock *sock)
     if (!DeviceIoControl(sock->handle, OVS_IOCTL_GET_PID,
                          NULL, 0, &pid, sizeof(pid),
                          &bytes, NULL)) {
+        lost_communication(GetLastError());
         retval = EINVAL;
     } else {
         if (bytes < sizeof(pid)) {
@@ -423,7 +442,58 @@ nl_sock_join_mcgroup(struct nl_sock *sock, unsigned int multicast_group)
     return 0;
 }
 
+/* When 'enable' is true, it tries to enable 'sock' to receive netlink
+ * notifications form all network namespaces that have an nsid assigned
+ * into the network namespace where the socket has been opened. The
+ * running kernel needs to provide support for that. When 'enable' is
+ * false, it will receive netlink notifications only from the network
+ * namespace where the socket has been opened.
+ *
+ * Returns 0 if successful, otherwise a positive errno.  */
+int
+nl_sock_listen_all_nsid(struct nl_sock *sock, bool enable)
+{
+    int error;
+    int val = enable ? 1 : 0;
+
+#ifndef _WIN32
+    if (setsockopt(sock->fd, SOL_NETLINK, NETLINK_LISTEN_ALL_NSID, &val,
+                   sizeof val) < 0) {
+        error = errno;
+        VLOG_INFO("netlink: could not %s listening to all nsid (%s)",
+                  enable ? "enable" : "disable", ovs_strerror(error));
+        return errno;
+    }
+#endif
+
+    return 0;
+}
+
 #ifdef _WIN32
+int
+nl_sock_subscribe_packet__(struct nl_sock *sock, bool subscribe)
+{
+    struct ofpbuf request;
+    uint64_t request_stub[128];
+    struct ovs_header *ovs_header;
+    struct nlmsghdr *nlmsg;
+    int error;
+
+    ofpbuf_use_stub(&request, request_stub, sizeof request_stub);
+    nl_msg_put_genlmsghdr(&request, 0, OVS_WIN_NL_CTRL_FAMILY_ID, 0,
+                          OVS_CTRL_CMD_PACKET_SUBSCRIBE_REQ,
+                          OVS_WIN_CONTROL_VERSION);
+
+    ovs_header = ofpbuf_put_uninit(&request, sizeof *ovs_header);
+    ovs_header->dp_ifindex = 0;
+    nl_msg_put_u8(&request, OVS_NL_ATTR_PACKET_SUBSCRIBE, subscribe ? 1 : 0);
+    nl_msg_put_u32(&request, OVS_NL_ATTR_PACKET_PID, sock->pid);
+
+    error = nl_sock_send(sock, &request, true);
+    ofpbuf_uninit(&request);
+    return error;
+}
+
 int
 nl_sock_subscribe_packets(struct nl_sock *sock)
 {
@@ -458,30 +528,6 @@ nl_sock_unsubscribe_packets(struct nl_sock *sock)
 
     sock->read_ioctl = OVS_IOCTL_READ;
     return 0;
-}
-
-int
-nl_sock_subscribe_packet__(struct nl_sock *sock, bool subscribe)
-{
-    struct ofpbuf request;
-    uint64_t request_stub[128];
-    struct ovs_header *ovs_header;
-    struct nlmsghdr *nlmsg;
-    int error;
-
-    ofpbuf_use_stub(&request, request_stub, sizeof request_stub);
-    nl_msg_put_genlmsghdr(&request, 0, OVS_WIN_NL_CTRL_FAMILY_ID, 0,
-                          OVS_CTRL_CMD_PACKET_SUBSCRIBE_REQ,
-                          OVS_WIN_CONTROL_VERSION);
-
-    ovs_header = ofpbuf_put_uninit(&request, sizeof *ovs_header);
-    ovs_header->dp_ifindex = 0;
-    nl_msg_put_u8(&request, OVS_NL_ATTR_PACKET_SUBSCRIBE, subscribe ? 1 : 0);
-    nl_msg_put_u32(&request, OVS_NL_ATTR_PACKET_PID, sock->pid);
-
-    error = nl_sock_send(sock, &request, true);
-    ofpbuf_uninit(&request);
-    return error;
 }
 #endif
 
@@ -535,11 +581,12 @@ nl_sock_send__(struct nl_sock *sock, const struct ofpbuf *msg,
         if (!DeviceIoControl(sock->handle, OVS_IOCTL_WRITE,
                              msg->data, msg->size, NULL, 0,
                              &bytes, NULL)) {
+            lost_communication(GetLastError());
             retval = -1;
             /* XXX: Map to a more appropriate error based on GetLastError(). */
             errno = EINVAL;
             VLOG_DBG_RL(&rl, "fatal driver failure in write: %s",
-                ovs_lasterror_to_string());
+                        ovs_lasterror_to_string());
         } else {
             retval = msg->size;
         }
@@ -589,7 +636,7 @@ nl_sock_send_seq(struct nl_sock *sock, const struct ofpbuf *msg,
 }
 
 static int
-nl_sock_recv__(struct nl_sock *sock, struct ofpbuf *buf, bool wait)
+nl_sock_recv__(struct nl_sock *sock, struct ofpbuf *buf, int *nsid, bool wait)
 {
     /* We can't accurately predict the size of the data to be received.  The
      * caller is supposed to have allocated enough space in 'buf' to handle the
@@ -600,7 +647,10 @@ nl_sock_recv__(struct nl_sock *sock, struct ofpbuf *buf, bool wait)
     uint8_t tail[65536];
     struct iovec iov[2];
     struct msghdr msg;
+    uint8_t msgctrl[64];
+    struct cmsghdr *cmsg;
     ssize_t retval;
+    int *ptr;
     int error;
 
     ovs_assert(buf->allocated >= sizeof *nlmsghdr);
@@ -614,6 +664,8 @@ nl_sock_recv__(struct nl_sock *sock, struct ofpbuf *buf, bool wait)
     memset(&msg, 0, sizeof msg);
     msg.msg_iov = iov;
     msg.msg_iovlen = 2;
+    msg.msg_control = msgctrl;
+    msg.msg_controllen = sizeof msgctrl;
 
     /* Receive a Netlink message from the kernel.
      *
@@ -629,6 +681,7 @@ nl_sock_recv__(struct nl_sock *sock, struct ofpbuf *buf, bool wait)
         DWORD bytes;
         if (!DeviceIoControl(sock->handle, sock->read_ioctl,
                              NULL, 0, tail, sizeof tail, &bytes, NULL)) {
+            lost_communication(GetLastError());
             VLOG_DBG_RL(&rl, "fatal driver failure in transact: %s",
                         ovs_lasterror_to_string());
             retval = -1;
@@ -687,6 +740,41 @@ nl_sock_recv__(struct nl_sock *sock, struct ofpbuf *buf, bool wait)
     }
 #endif
 
+    if (nsid) {
+        /* The network namespace id from which the message was sent comes
+         * as ancillary data. For older kernels, this data is either not
+         * available or it might be -1, so it falls back to local network
+         * namespace (no id). Latest kernels return a valid ID only if
+         * available or nothing. */
+        netnsid_set_local(nsid);
+#ifndef _WIN32
+        cmsg = CMSG_FIRSTHDR(&msg);
+        while (cmsg != NULL) {
+            if (cmsg->cmsg_level == SOL_NETLINK
+                && cmsg->cmsg_type == NETLINK_LISTEN_ALL_NSID) {
+                ptr = ALIGNED_CAST(int *, CMSG_DATA(cmsg));
+                netnsid_set(nsid, *ptr);
+            }
+            if (cmsg->cmsg_level == SOL_SOCKET
+                && cmsg->cmsg_type == SCM_RIGHTS) {
+                /* This is unexpected and unwanted, close all fds */
+                int nfds;
+                int i;
+                nfds = (cmsg->cmsg_len - CMSG_ALIGN(sizeof(struct cmsghdr)))
+                       / sizeof(int);
+                ptr = ALIGNED_CAST(int *, CMSG_DATA(cmsg));
+                for (i = 0; i < nfds; i++) {
+                    VLOG_ERR_RL(&rl, "closing unexpected received fd (%d).",
+                                ptr[i]);
+                    close(ptr[i]);
+                }
+            }
+
+            cmsg = CMSG_NXTHDR(&msg, cmsg);
+        }
+#endif
+    }
+
     log_nlmsg(__func__, 0, buf->data, buf->size, sock->protocol);
     COVERAGE_INC(netlink_received);
 
@@ -695,7 +783,8 @@ nl_sock_recv__(struct nl_sock *sock, struct ofpbuf *buf, bool wait)
 
 /* Tries to receive a Netlink message from the kernel on 'sock' into 'buf'.  If
  * 'wait' is true, waits for a message to be ready.  Otherwise, fails with
- * EAGAIN if the 'sock' receive buffer is empty.
+ * EAGAIN if the 'sock' receive buffer is empty.  If 'nsid' is provided, the
+ * network namespace id from which the message was sent will be provided.
  *
  * The caller must have initialized 'buf' with an allocation of at least
  * NLMSG_HDRLEN bytes.  For best performance, the caller should allocate enough
@@ -711,9 +800,9 @@ nl_sock_recv__(struct nl_sock *sock, struct ofpbuf *buf, bool wait)
  * Regardless of success or failure, this function resets 'buf''s headroom to
  * 0. */
 int
-nl_sock_recv(struct nl_sock *sock, struct ofpbuf *buf, bool wait)
+nl_sock_recv(struct nl_sock *sock, struct ofpbuf *buf, int *nsid, bool wait)
 {
-    return nl_sock_recv__(sock, buf, wait);
+    return nl_sock_recv__(sock, buf, nsid, wait);
 }
 
 static void
@@ -802,7 +891,7 @@ nl_sock_transact_multiple__(struct nl_sock *sock,
         }
 
         /* Receive a reply. */
-        error = nl_sock_recv__(sock, buf_txn->reply, false);
+        error = nl_sock_recv__(sock, buf_txn->reply, NULL, false);
         if (error) {
             if (error == EAGAIN) {
                 nl_sock_record_errors__(transactions, n, 0);
@@ -879,6 +968,7 @@ nl_sock_transact_multiple__(struct nl_sock *sock,
             }
         } else if (!ret) {
             /* XXX: Map to a more appropriate error. */
+            lost_communication(GetLastError());
             error = EINVAL;
             VLOG_DBG_RL(&rl, "fatal driver failure: %s",
                 ovs_lasterror_to_string());
@@ -886,6 +976,8 @@ nl_sock_transact_multiple__(struct nl_sock *sock,
         }
 
         if (reply_len != 0) {
+            request_nlmsg = nl_msg_nlmsghdr(txn->request);
+
             if (reply_len < sizeof *reply_nlmsg) {
                 nl_sock_record_errors__(transactions, n, 0);
                 VLOG_DBG_RL(&rl, "insufficient length of reply %#"PRIu32
@@ -894,7 +986,6 @@ nl_sock_transact_multiple__(struct nl_sock *sock,
             }
 
             /* Validate the sequence number in the reply. */
-            request_nlmsg = nl_msg_nlmsghdr(txn->request);
             reply_nlmsg = (struct nlmsghdr *)reply_buf;
 
             if (request_nlmsg->nlmsg_seq != reply_nlmsg->nlmsg_seq) {
@@ -1080,7 +1171,7 @@ nl_dump_refill(struct nl_dump *dump, struct ofpbuf *buffer)
     int error;
 
     while (!buffer->size) {
-        error = nl_sock_recv__(dump->sock, buffer, false);
+        error = nl_sock_recv__(dump->sock, buffer, NULL, false);
         if (error) {
             /* The kernel never blocks providing the results of a dump, so
              * error == EAGAIN means that we've read the whole thing, and
@@ -1275,6 +1366,7 @@ pend_io_request(struct nl_sock *sock)
         error = GetLastError();
         /* Check if the I/O got pended */
         if (error != ERROR_IO_INCOMPLETE && error != ERROR_IO_PENDING) {
+            lost_communication(error);
             VLOG_ERR("nl_sock_wait failed - %s\n", ovs_format_message(error));
             retval = EINVAL;
         }
@@ -1698,7 +1790,9 @@ nl_transact(int protocol, const struct ofpbuf *request,
 
     error = nl_pool_alloc(protocol, &sock);
     if (error) {
-        *replyp = NULL;
+        if (replyp) {
+            *replyp = NULL;
+        }
         return error;
     }
 

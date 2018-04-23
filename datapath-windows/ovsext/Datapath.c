@@ -429,12 +429,14 @@ OvsCleanup()
     }
 }
 
+_Use_decl_annotations_
 VOID
 OvsAcquireCtrlLock()
 {
     NdisAcquireSpinLock(gOvsCtrlLock);
 }
 
+_Use_decl_annotations_
 VOID
 OvsReleaseCtrlLock()
 {
@@ -646,6 +648,7 @@ OvsOpenCloseDevice(PDEVICE_OBJECT deviceObject,
     POVS_DEVICE_EXTENSION ovsExt =
         (POVS_DEVICE_EXTENSION)NdisGetDeviceReservedExtension(deviceObject);
 
+#pragma warning(suppress: 28118)
     PAGED_CODE();
     ASSERT(deviceObject == gOvsDeviceObject);
     ASSERT(ovsExt != NULL);
@@ -679,6 +682,7 @@ NTSTATUS
 OvsCleanupDevice(PDEVICE_OBJECT deviceObject,
                  PIRP irp)
 {
+#pragma warning(suppress: 28118)
     PAGED_CODE();
     PIO_STACK_LOCATION irpSp;
     PFILE_OBJECT fileObject;
@@ -728,6 +732,7 @@ OvsDeviceControl(PDEVICE_OBJECT deviceObject,
     NETLINK_FAMILY *nlFamilyOps;
     OVS_USER_PARAMS_CONTEXT usrParamsCtx;
 
+#pragma warning(suppress: 28118)
     PAGED_CODE();
 #ifdef DBG
     POVS_DEVICE_EXTENSION ovsExt =
@@ -1312,6 +1317,9 @@ OvsSubscribeEventCmdHandler(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
         if (mcastGrp == NFNLGRP_CONNTRACK_DESTROY) {
             request.mask = OVS_EVENT_CT_DELETE;
         }
+        if (mcastGrp == NFNLGRP_CONNTRACK_UPDATE) {
+            request.mask = OVS_EVENT_CT_UPDATE;
+        }
     }
 
     status = OvsSubscribeEventIoctl(instance->fileObject, &request,
@@ -1585,8 +1593,7 @@ MapIrpOutputBuffer(PIRP irp,
     if (irp->MdlAddress == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
-    *buffer = MmGetSystemAddressForMdlSafe(irp->MdlAddress,
-                                           NormalPagePriority);
+    *buffer = OvsGetMdlWithLowPriority(irp->MdlAddress);
     if (*buffer == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -1673,7 +1680,6 @@ OvsReadEventCmdHandler(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
                        UINT32 *replyLen)
 {
     POVS_MESSAGE msgOut = (POVS_MESSAGE)usrParamsCtx->outputBuffer;
-    POVS_MESSAGE msgIn = (POVS_MESSAGE)usrParamsCtx->inputBuffer;
     POVS_OPEN_INSTANCE instance =
         (POVS_OPEN_INSTANCE)usrParamsCtx->ovsInstance;
     NL_BUFFER nlBuf;
@@ -1708,11 +1714,12 @@ OvsReadEventCmdHandler(POVS_USER_PARAMS_CONTEXT usrParamsCtx,
             goto cleanup;
         }
 
+        /* Driver intiated messages should have zero seq number */
         status = OvsCreateNlMsgFromCtEntry(&ctEventEntry.entry,
                                            usrParamsCtx->outputBuffer,
                                            usrParamsCtx->outputLength,
                                            ctEventEntry.type,
-                                           msgIn->nlMsg.nlmsgSeq,
+                                           0, /* No input msg */
                                            usrParamsCtx->ovsInstance->pid,
                                            NFNETLINK_V0,
                                            gOvsSwitchContext->dpNo);

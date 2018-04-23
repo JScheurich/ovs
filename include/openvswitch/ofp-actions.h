@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2013, 2014, 2015, 2016 Nicira, Inc.
+ * Copyright (c) 2012, 2013, 2014, 2015, 2016, 2017 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,9 +22,16 @@
 #include "openflow/openflow.h"
 #include "openflow/nicira-ext.h"
 #include "openvswitch/meta-flow.h"
-#include "openvswitch/ofp-util.h"
 #include "openvswitch/ofp-errors.h"
+#include "openvswitch/ofp-protocol.h"
 #include "openvswitch/types.h"
+#include "openvswitch/ofp-ed-props.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+struct vl_mff_map;
 
 /* List of OVS abstracted actions.
  *
@@ -66,7 +73,7 @@
     OFPACT(SET_VLAN_VID,    ofpact_vlan_vid,    ofpact, "set_vlan_vid") \
     OFPACT(SET_VLAN_PCP,    ofpact_vlan_pcp,    ofpact, "set_vlan_pcp") \
     OFPACT(STRIP_VLAN,      ofpact_null,        ofpact, "strip_vlan")   \
-    OFPACT(PUSH_VLAN,       ofpact_null,        ofpact, "push_vlan")    \
+    OFPACT(PUSH_VLAN,       ofpact_push_vlan,   ofpact, "push_vlan")    \
     OFPACT(SET_ETH_SRC,     ofpact_mac,         ofpact, "mod_dl_src")   \
     OFPACT(SET_ETH_DST,     ofpact_mac,         ofpact, "mod_dl_dst")   \
     OFPACT(SET_IPV4_SRC,    ofpact_ipv4,        ofpact, "mod_nw_src")   \
@@ -86,6 +93,11 @@
     OFPACT(DEC_MPLS_TTL,    ofpact_null,        ofpact, "dec_mpls_ttl") \
     OFPACT(PUSH_MPLS,       ofpact_push_mpls,   ofpact, "push_mpls")    \
     OFPACT(POP_MPLS,        ofpact_pop_mpls,    ofpact, "pop_mpls")     \
+    OFPACT(DEC_NSH_TTL,     ofpact_null,        ofpact, "dec_nsh_ttl")  \
+                                                                        \
+    /* Generic encap & decap */                                         \
+    OFPACT(ENCAP,           ofpact_encap,       props, "encap")         \
+    OFPACT(DECAP,           ofpact_decap,       ofpact, "decap")        \
                                                                         \
     /* Metadata. */                                                     \
     OFPACT(SET_TUNNEL,      ofpact_tunnel,      ofpact, "set_tunnel")   \
@@ -107,19 +119,22 @@
     OFPACT(SAMPLE,          ofpact_sample,      ofpact, "sample")       \
     OFPACT(UNROLL_XLATE,    ofpact_unroll_xlate, ofpact, "unroll_xlate") \
     OFPACT(CT,              ofpact_conntrack,   ofpact, "ct")           \
+    OFPACT(CT_CLEAR,        ofpact_null,        ofpact, "ct_clear")     \
     OFPACT(NAT,             ofpact_nat,         ofpact, "nat")          \
     OFPACT(OUTPUT_TRUNC,    ofpact_output_trunc,ofpact, "output_trunc") \
+    OFPACT(CLONE,           ofpact_nest,        actions, "clone")       \
                                                                         \
     /* Debugging actions.                                               \
      *                                                                  \
      * These are intentionally undocumented, subject to change, and     \
      * only accepted if ovs-vswitchd is started with --enable-dummy. */ \
     OFPACT(DEBUG_RECIRC, ofpact_null,           ofpact, "debug_recirc") \
+    OFPACT(DEBUG_SLOW,   ofpact_null,           ofpact, "debug_slow")   \
                                                                         \
     /* Instructions. */                                                 \
     OFPACT(METER,           ofpact_meter,       ofpact, "meter")        \
     OFPACT(CLEAR_ACTIONS,   ofpact_null,        ofpact, "clear_actions") \
-    OFPACT(WRITE_ACTIONS,   ofpact_nest,        ofpact, "write_actions") \
+    OFPACT(WRITE_ACTIONS,   ofpact_nest,        actions, "write_actions") \
     OFPACT(WRITE_METADATA,  ofpact_metadata,    ofpact, "write_metadata") \
     OFPACT(GOTO_TABLE,      ofpact_goto_table,  ofpact, "goto_table")
 
@@ -158,8 +173,8 @@ enum {
  *       NXAST_SET_TUNNEL64.  In these cases, if the "struct ofpact" originated
  *       from OpenFlow, then we want to make sure that, if it gets translated
  *       back to OpenFlow later, it is translated back to the same action type.
- *       (Otherwise, we'd violate the promise made in DESIGN, in the "Action
- *       Reproduction" section.)
+ *       (Otherwise, we'd violate the promise made in the topics/design doc, in
+ *       the "Action Reproduction" section.)
  *
  *       For such actions, the 'raw' member should be the "enum ofp_raw_action"
  *       originally extracted from the OpenFlow action.  (If the action didn't
@@ -185,25 +200,14 @@ BUILD_ASSERT_DECL(sizeof(struct ofpact) == 4);
 /* Alignment. */
 #define OFPACT_ALIGNTO 8
 #define OFPACT_ALIGN(SIZE) ROUND_UP(SIZE, OFPACT_ALIGNTO)
-
-/* Expands to an anonymous union that contains:
- *
- *    - MEMBERS in a nested anonymous struct.
- *
- *    - An array as large as MEMBERS plus padding to a multiple of 8 bytes.
- *
- * The effect is to pad MEMBERS to a multiple of 8 bytes. */
-#define OFPACT_PADDED_MEMBERS(MEMBERS)                          \
-    union {                                                     \
-        struct { MEMBERS };                                     \
-        uint8_t pad[OFPACT_ALIGN(sizeof(struct { MEMBERS }))];  \
-    }
+#define OFPACT_PADDED_MEMBERS(MEMBERS) PADDED_MEMBERS(OFPACT_ALIGNTO, MEMBERS)
 
 /* Returns the ofpact following 'ofpact'. */
 static inline struct ofpact *
 ofpact_next(const struct ofpact *ofpact)
 {
-    return (void *) ((uint8_t *) ofpact + OFPACT_ALIGN(ofpact->len));
+    return ALIGNED_CAST(struct ofpact *,
+                        (uint8_t *) ofpact + OFPACT_ALIGN(ofpact->len));
 }
 
 struct ofpact *ofpact_next_flattened(const struct ofpact *);
@@ -211,24 +215,15 @@ struct ofpact *ofpact_next_flattened(const struct ofpact *);
 static inline struct ofpact *
 ofpact_end(const struct ofpact *ofpacts, size_t ofpacts_len)
 {
-    return (void *) ((uint8_t *) ofpacts + ofpacts_len);
+    return ALIGNED_CAST(struct ofpact *, (uint8_t *) ofpacts + ofpacts_len);
 }
 
-static inline const struct ofpact *
-ofpact_find_type(const struct ofpact *a, enum ofpact_type type,
-                 const struct ofpact * const end)
+static inline bool
+ofpact_last(const struct ofpact *a, const struct ofpact *ofpacts,
+            size_t ofpact_len)
 {
-    while (a < end) {
-        if (a->type == type) {
-            return a;
-        }
-        a = ofpact_next(a);
-    }
-    return NULL;
+    return ofpact_next(a) == ofpact_end(ofpacts, ofpact_len);
 }
-
-#define OFPACT_FIND_TYPE(A, TYPE, END) \
-    ofpact_get_##TYPE##_nullable(ofpact_find_type(A, OFPACT_##TYPE, END))
 
 static inline const struct ofpact *
 ofpact_find_type_flattened(const struct ofpact *a, enum ofpact_type type,
@@ -252,13 +247,6 @@ ofpact_find_type_flattened(const struct ofpact *a, enum ofpact_type type,
 #define OFPACT_FOR_EACH(POS, OFPACTS, OFPACTS_LEN)                      \
     for ((POS) = (OFPACTS); (POS) < ofpact_end(OFPACTS, OFPACTS_LEN);  \
          (POS) = ofpact_next(POS))
-
-#define OFPACT_FOR_EACH_TYPE(POS, TYPE, OFPACTS, OFPACTS_LEN)           \
-    for ((POS) = OFPACT_FIND_TYPE(OFPACTS, TYPE,                        \
-                                  ofpact_end(OFPACTS, OFPACTS_LEN));    \
-         (POS);                                                         \
-         (POS) = OFPACT_FIND_TYPE(ofpact_next(&(POS)->ofpact), TYPE,    \
-                                  ofpact_end(OFPACTS, OFPACTS_LEN)))
 
 /* Assigns POS to each ofpact, in turn, in the OFPACTS_LEN bytes of ofpacts
  * starting at OFPACTS.
@@ -421,6 +409,14 @@ struct ofpact_vlan_pcp {
     bool flow_has_vlan;         /* VLAN present at action validation time? */
 };
 
+/* OFPACT_PUSH_VLAN.
+ *
+ * Used for OFPAT11_PUSH_VLAN. */
+struct ofpact_push_vlan {
+    struct ofpact ofpact;
+    ovs_be16 ethertype;
+};
+
 /* OFPACT_SET_ETH_SRC, OFPACT_SET_ETH_DST.
  *
  * Used for OFPAT10_SET_DL_SRC, OFPAT10_SET_DL_DST. */
@@ -479,7 +475,7 @@ struct ofpact_reg_move {
     struct mf_subfield dst;
 };
 
-/* OFPACT_STACK_PUSH.
+/* OFPACT_STACK_PUSH, OFPACT_STACK_POP.
  *
  * Used for NXAST_STACK_PUSH and NXAST_STACK_POP. */
 struct ofpact_stack {
@@ -491,12 +487,23 @@ struct ofpact_stack {
  *
  * Used for NXAST_REG_LOAD and OFPAT12_SET_FIELD. */
 struct ofpact_set_field {
-    struct ofpact ofpact;
-    const struct mf_field *field;
-    bool flow_has_vlan;   /* VLAN present at action validation time. */
-    union mf_value value;
-    union mf_value mask;
+    OFPACT_PADDED_MEMBERS(
+        struct ofpact ofpact;
+        bool flow_has_vlan;   /* VLAN present at action validation time. */
+        const struct mf_field *field;
+    );
+    union mf_value value[];  /* Significant value bytes followed by
+                              * significant mask bytes. */
 };
+BUILD_ASSERT_DECL(offsetof(struct ofpact_set_field, value)
+                  % OFPACT_ALIGNTO == 0);
+BUILD_ASSERT_DECL(offsetof(struct ofpact_set_field, value)
+                  == sizeof(struct ofpact_set_field));
+
+/* Use macro to not have to deal with constness. */
+#define ofpact_set_field_mask(SF)                               \
+    ALIGNED_CAST(union mf_value *,                              \
+                 (uint8_t *)(SF)->value + (SF)->field->n_bytes)
 
 /* OFPACT_PUSH_VLAN/MPLS/PBB
  *
@@ -554,11 +561,12 @@ struct ofpact_metadata {
 struct ofpact_meter {
     struct ofpact ofpact;
     uint32_t meter_id;
+    uint32_t provider_meter_id;
 };
 
-/* OFPACT_WRITE_ACTIONS.
+/* OFPACT_WRITE_ACTIONS, OFPACT_CLONE.
  *
- * Used for OFPIT11_WRITE_ACTIONS. */
+ * Used for OFPIT11_WRITE_ACTIONS, NXAST_CLONE. */
 struct ofpact_nest {
     OFPACT_PADDED_MEMBERS(struct ofpact ofpact;);
     struct ofpact actions[];
@@ -567,12 +575,23 @@ BUILD_ASSERT_DECL(offsetof(struct ofpact_nest, actions) % OFPACT_ALIGNTO == 0);
 BUILD_ASSERT_DECL(offsetof(struct ofpact_nest, actions)
                   == sizeof(struct ofpact_nest));
 
+static inline size_t
+ofpact_nest_get_action_len(const struct ofpact_nest *on)
+{
+    return on->ofpact.len - offsetof(struct ofpact_nest, actions);
+}
+
 /* Bits for 'flags' in struct nx_action_conntrack.
  *
  * If NX_CT_F_COMMIT is set, then the connection entry is moved from the
- * unconfirmed to confirmed list in the tracker. */
+ * unconfirmed to confirmed list in the tracker.
+ * If NX_CT_F_FORCE is set, in addition to NX_CT_F_COMMIT, then the conntrack
+ * entry is replaced with a new one in case the original direction of the
+ * existing entry is opposite of the current packet direction.
+ */
 enum nx_conntrack_flags {
     NX_CT_F_COMMIT = 1 << 0,
+    NX_CT_F_FORCE  = 1 << 1,
 };
 
 /* Magic value for struct nx_action_conntrack 'recirc_table' field, to specify
@@ -580,7 +599,11 @@ enum nx_conntrack_flags {
 #define NX_CT_RECIRC_NONE OFPTT_ALL
 
 #if !defined(IPPORT_FTP)
-#define	IPPORT_FTP  21
+#define IPPORT_FTP  21
+#endif
+
+#if !defined(IPPORT_TFTP)
+#define IPPORT_TFTP  69
 #endif
 
 /* OFPACT_CT.
@@ -606,12 +629,6 @@ static inline size_t
 ofpact_ct_get_action_len(const struct ofpact_conntrack *oc)
 {
     return oc->ofpact.len - offsetof(struct ofpact_conntrack, actions);
-}
-
-static inline size_t
-ofpact_nest_get_action_len(const struct ofpact_nest *on)
-{
-    return on->ofpact.len - offsetof(struct ofpact_nest, actions);
 }
 
 void ofpacts_execute_action_set(struct ofpbuf *action_list,
@@ -656,30 +673,23 @@ struct ofpact_nat {
 
 /* OFPACT_RESUBMIT.
  *
- * Used for NXAST_RESUBMIT, NXAST_RESUBMIT_TABLE. */
+ * Used for NXAST_RESUBMIT, NXAST_RESUBMIT_TABLE, NXAST_RESUBMIT_TABLE_CT. */
 struct ofpact_resubmit {
     struct ofpact ofpact;
     ofp_port_t in_port;
     uint8_t table_id;
+    bool with_ct_orig;   /* Resubmit with Conntrack original direction tuple
+                          * fields in place of IP header fields. */
 };
-
-/* Part of struct ofpact_learn, below. */
-struct ofpact_learn_spec {
-    int n_bits;                 /* Number of bits in source and dest. */
-
-    int src_type;               /* One of NX_LEARN_SRC_*. */
-    struct mf_subfield src;     /* NX_LEARN_SRC_FIELD only. */
-    union mf_subvalue src_imm;  /* NX_LEARN_SRC_IMMEDIATE only. */
-
-    int dst_type;             /* One of NX_LEARN_DST_*. */
-    struct mf_subfield dst;   /* NX_LEARN_DST_MATCH, NX_LEARN_DST_LOAD only. */
-};
-
 
 /* Bits for 'flags' in struct nx_action_learn.
  *
  * If NX_LEARN_F_SEND_FLOW_REM is set, then the learned flows will have their
  * OFPFF_SEND_FLOW_REM flag set.
+ *
+ * If NX_LEARN_F_WRITE_RESULT is set, then the actions will write whether the
+ * learn operation succeded on a bit.  If the learn is successful the bit will
+ * be set, otherwise (e.g. if the limit is hit) the bit will be unset.
  *
  * If NX_LEARN_F_DELETE_LEARNED is set, then removing this action will delete
  * all the flows from the learn action's 'table_id' that have the learn
@@ -706,6 +716,7 @@ struct ofpact_learn_spec {
 enum nx_learn_flags {
     NX_LEARN_F_SEND_FLOW_REM = 1 << 0,
     NX_LEARN_F_DELETE_LEARNED = 1 << 1,
+    NX_LEARN_F_WRITE_RESULT = 1 << 2,
 };
 
 #define NX_LEARN_N_BITS_MASK    0x3ff
@@ -720,24 +731,78 @@ enum nx_learn_flags {
 #define NX_LEARN_DST_RESERVED  (3 << 11) /* Not yet defined. */
 #define NX_LEARN_DST_MASK      (3 << 11)
 
+/* Part of struct ofpact_learn, below. */
+struct ofpact_learn_spec {
+    OFPACT_PADDED_MEMBERS(
+        struct mf_subfield src;    /* NX_LEARN_SRC_FIELD only. */
+        struct mf_subfield dst;    /* NX_LEARN_DST_MATCH,
+                                    * NX_LEARN_DST_LOAD only. */
+        uint16_t src_type;         /* One of NX_LEARN_SRC_*. */
+        uint16_t dst_type;         /* One of NX_LEARN_DST_*. */
+        uint8_t n_bits;            /* Number of bits in source and dest. */
+    );
+    /* Followed by 'DIV_ROUND_UP(n_bits, 8)' bytes of immediate data for
+     * match 'dst_type's NX_LEARN_DST_MATCH and NX_LEARN_DST_LOAD when
+     * NX_LEARN_SRC_IMMEDIATE is set in 'src_type', followed by zeroes to align
+     * to OFPACT_ALIGNTO. */
+};
+BUILD_ASSERT_DECL(sizeof(struct ofpact_learn_spec) % OFPACT_ALIGNTO == 0);
+
+static inline const void *
+ofpact_learn_spec_imm(const struct ofpact_learn_spec *spec)
+{
+    return spec + 1;
+}
+
+static inline const struct ofpact_learn_spec *
+ofpact_learn_spec_next(const struct ofpact_learn_spec *spec)
+{
+    if (spec->src_type == NX_LEARN_SRC_IMMEDIATE) {
+        unsigned int n_bytes = OFPACT_ALIGN(DIV_ROUND_UP(spec->n_bits, 8));
+        return ALIGNED_CAST(const struct ofpact_learn_spec *,
+                            (const uint8_t *)(spec + 1) + n_bytes);
+    }
+    return spec + 1;
+}
+
 /* OFPACT_LEARN.
  *
  * Used for NXAST_LEARN. */
 struct ofpact_learn {
-    struct ofpact ofpact;
+    OFPACT_PADDED_MEMBERS(
+        struct ofpact ofpact;
 
-    uint16_t idle_timeout;      /* Idle time before discarding (seconds). */
-    uint16_t hard_timeout;      /* Max time before discarding (seconds). */
-    uint16_t priority;          /* Priority level of flow entry. */
-    uint8_t table_id;           /* Table to insert flow entry. */
-    ovs_be64 cookie;            /* Cookie for new flow. */
-    enum nx_learn_flags flags;  /* NX_LEARN_F_*. */
-    uint16_t fin_idle_timeout;  /* Idle timeout after FIN, if nonzero. */
-    uint16_t fin_hard_timeout;  /* Hard timeout after FIN, if nonzero. */
+        uint16_t idle_timeout;     /* Idle time before discarding (seconds). */
+        uint16_t hard_timeout;     /* Max time before discarding (seconds). */
+        uint16_t priority;         /* Priority level of flow entry. */
+        uint8_t table_id;          /* Table to insert flow entry. */
+        enum nx_learn_flags flags; /* NX_LEARN_F_*. */
+        ovs_be64 cookie;           /* Cookie for new flow. */
+        uint16_t fin_idle_timeout; /* Idle timeout after FIN, if nonzero. */
+        uint16_t fin_hard_timeout; /* Hard timeout after FIN, if nonzero. */
+        /* If the number of flows on 'table_id' with 'cookie' exceeds this,
+         * the action will not add a new flow. 0 indicates unlimited. */
+        uint32_t limit;
+        /* Used only if 'flags' has NX_LEARN_F_WRITE_RESULT.  If the execution
+         * failed to install a new flow because 'limit' is exceeded,
+         * result_dst will be set to 0, otherwise to 1. */
+        struct mf_subfield result_dst;
+    );
 
-    unsigned int n_specs;
     struct ofpact_learn_spec specs[];
 };
+
+static inline const struct ofpact_learn_spec *
+ofpact_learn_spec_end(const struct ofpact_learn *learn)
+{
+    return ALIGNED_CAST(const struct ofpact_learn_spec *,
+                        ofpact_next(&learn->ofpact));
+}
+
+#define OFPACT_LEARN_SPEC_FOR_EACH(SPEC, LEARN) \
+    for ((SPEC) = (LEARN)->specs;               \
+         (SPEC) < ofpact_learn_spec_end(LEARN); \
+         (SPEC) = ofpact_learn_spec_next(SPEC))
 
 /* Multipath link choice algorithm to apply.
  *
@@ -831,9 +896,23 @@ struct ofpact_note {
     uint8_t data[];
 };
 
+/* Direction of sampled packets. */
+enum nx_action_sample_direction {
+    /* OVS will attempt to infer the sample's direction based on whether
+     * 'sampling_port' is the packet's output port.  This is generally
+     * effective except when sampling happens as part of an output to a patch
+     * port, which doesn't involve a datapath output action. */
+    NX_ACTION_SAMPLE_DEFAULT,
+
+    /* Explicit direction.  This is useful for sampling packets coming in from
+     * or going out of a patch port, where the direction cannot be inferred. */
+    NX_ACTION_SAMPLE_INGRESS,
+    NX_ACTION_SAMPLE_EGRESS
+};
+
 /* OFPACT_SAMPLE.
  *
- * Used for NXAST_SAMPLE and NXAST_SAMPLE2. */
+ * Used for NXAST_SAMPLE, NXAST_SAMPLE2, and NXAST_SAMPLE3. */
 struct ofpact_sample {
     struct ofpact ofpact;
     uint16_t probability;  /* Always positive. */
@@ -841,6 +920,7 @@ struct ofpact_sample {
     uint32_t obs_domain_id;
     uint32_t obs_point_id;
     ofp_port_t sampling_port;
+    enum nx_action_sample_direction direction;
 };
 
 /* OFPACT_DEC_TTL.
@@ -908,21 +988,53 @@ struct ofpact_unroll_xlate {
     ovs_be64 rule_cookie;         /* OVS_BE64_MAX if none. */
 };
 
+/* OFPACT_ENCAP.
+ *
+ * Used for NXAST_ENCAP. */
+
+struct ofpact_encap {
+    struct ofpact ofpact;
+    ovs_be32 new_pkt_type;        /* Packet type of the header to add. */
+    uint16_t hdr_size;            /* New header size in bytes. */
+    uint16_t n_props;             /* Number of encap properties. */
+    struct ofpact_ed_prop props[]; /* Properties in internal format. */
+};
+
+/* OFPACT_DECAP.
+ *
+ * Used for NXAST_DECAP. */
+struct ofpact_decap {
+    struct ofpact ofpact;
+
+    /* New packet type.
+     *
+     * The special value (0,0xFFFE) "Use next proto" is used to request OVS to
+     * automatically set the new packet type based on the decap'ed header's
+     * next protocol.
+     */
+    ovs_be32 new_pkt_type;
+};
+
 /* Converting OpenFlow to ofpacts. */
 enum ofperr ofpacts_pull_openflow_actions(struct ofpbuf *openflow,
                                           unsigned int actions_len,
                                           enum ofp_version version,
+                                          const struct vl_mff_map *,
+                                          uint64_t *ofpacts_tlv_bitmap,
                                           struct ofpbuf *ofpacts);
-enum ofperr ofpacts_pull_openflow_instructions(struct ofpbuf *openflow,
-                                               unsigned int instructions_len,
-                                               enum ofp_version version,
-                                               struct ofpbuf *ofpacts);
+enum ofperr
+ofpacts_pull_openflow_instructions(struct ofpbuf *openflow,
+                                   unsigned int instructions_len,
+                                   enum ofp_version version,
+                                   const struct vl_mff_map *vl_mff_map,
+                                   uint64_t *ofpacts_tlv_bitmap,
+                                   struct ofpbuf *ofpacts);
 enum ofperr ofpacts_check(struct ofpact[], size_t ofpacts_len,
-                          struct flow *, ofp_port_t max_ports,
+                          struct match *, ofp_port_t max_ports,
                           uint8_t table_id, uint8_t n_tables,
                           enum ofputil_protocol *usable_protocols);
 enum ofperr ofpacts_check_consistency(struct ofpact[], size_t ofpacts_len,
-                                      struct flow *, ofp_port_t max_ports,
+                                      struct match *, ofp_port_t max_ports,
                                       uint8_t table_id, uint8_t n_tables,
                                       enum ofputil_protocol usable_protocols);
 enum ofperr ofpact_check_output_port(ofp_port_t port, ofp_port_t max_ports);
@@ -947,18 +1059,39 @@ bool ofpacts_output_to_group(const struct ofpact[], size_t ofpacts_len,
                              uint32_t group_id);
 bool ofpacts_equal(const struct ofpact a[], size_t a_len,
                    const struct ofpact b[], size_t b_len);
+bool ofpacts_equal_stringwise(const struct ofpact a[], size_t a_len,
+                              const struct ofpact b[], size_t b_len);
 const struct mf_field *ofpact_get_mf_dst(const struct ofpact *ofpact);
 uint32_t ofpacts_get_meter(const struct ofpact[], size_t ofpacts_len);
 
-/* Formatting and parsing ofpacts. */
-void ofpacts_format(const struct ofpact[], size_t ofpacts_len, struct ds *);
-char *ofpacts_parse_actions(const char *, struct ofpbuf *ofpacts,
-                            enum ofputil_protocol *usable_protocols)
-    OVS_WARN_UNUSED_RESULT;
-char *ofpacts_parse_instructions(const char *, struct ofpbuf *ofpacts,
-                                 enum ofputil_protocol *usable_protocols)
-    OVS_WARN_UNUSED_RESULT;
+/* Formatting ofpacts. */
+struct ofpact_format_params {
+    /* Input. */
+    const struct ofputil_port_map *port_map;
+    const struct ofputil_table_map *table_map;
+
+    /* Output. */
+    struct ds *s;
+};
+void ofpacts_format(const struct ofpact[], size_t ofpacts_len,
+                    const struct ofpact_format_params *);
 const char *ofpact_name(enum ofpact_type);
+
+/* Parsing ofpacts. */
+struct ofpact_parse_params {
+    /* Input. */
+    const struct ofputil_port_map *port_map;
+    const struct ofputil_table_map *table_map;
+
+    /* Output. */
+    struct ofpbuf *ofpacts;
+    enum ofputil_protocol *usable_protocols;
+};
+char *ofpacts_parse_actions(const char *, const struct ofpact_parse_params *)
+    OVS_WARN_UNUSED_RESULT;
+char *ofpacts_parse_instructions(const char *,
+                                 const struct ofpact_parse_params *)
+    OVS_WARN_UNUSED_RESULT;
 
 /* Internal use by the helpers below. */
 void ofpact_init(struct ofpact *, enum ofpact_type, size_t len);
@@ -1013,7 +1146,7 @@ void *ofpact_finish(struct ofpbuf *, struct ofpact *);
     BUILD_ASSERT_DECL(offsetof(struct STRUCT, ofpact) == 0);            \
                                                                         \
     enum { OFPACT_##ENUM##_SIZE                                         \
-           = (offsetof(struct STRUCT, MEMBER)                           \
+           = (offsetof(struct STRUCT, MEMBER) != 0                      \
               ? offsetof(struct STRUCT, MEMBER)                         \
               : OFPACT_ALIGN(sizeof(struct STRUCT))) };                 \
                                                                         \
@@ -1034,8 +1167,8 @@ void *ofpact_finish(struct ofpbuf *, struct ofpact *);
     static inline struct STRUCT *                                       \
     ofpact_put_##ENUM(struct ofpbuf *ofpacts)                           \
     {                                                                   \
-        return ofpact_put(ofpacts, OFPACT_##ENUM,                       \
-                          OFPACT_##ENUM##_SIZE);                        \
+        return (struct STRUCT *) ofpact_put(ofpacts, OFPACT_##ENUM,     \
+                                            OFPACT_##ENUM##_SIZE);      \
     }                                                                   \
                                                                         \
     static inline void                                                  \
@@ -1050,13 +1183,24 @@ void *ofpact_finish(struct ofpbuf *, struct ofpact *);
     {                                                                   \
         struct ofpact *ofpact = &(*ofpactp)->ofpact;                    \
         ovs_assert(ofpact->type == OFPACT_##ENUM);                      \
-        *ofpactp = ofpact_finish(ofpbuf, ofpact);                       \
+        *ofpactp = (struct STRUCT *) ofpact_finish(ofpbuf, ofpact);     \
     }
 OFPACTS
 #undef OFPACT
 
 /* Additional functions for composing ofpacts. */
-struct ofpact_set_field *ofpact_put_reg_load(struct ofpbuf *ofpacts);
+struct ofpact_set_field *ofpact_put_set_field(struct ofpbuf *ofpacts,
+                                              const struct mf_field *,
+                                              const void *value,
+                                              const void *mask);
+struct ofpact_set_field *ofpact_put_reg_load(struct ofpbuf *ofpacts,
+                                             const struct mf_field *,
+                                             const void *value,
+                                             const void *mask);
+struct ofpact_set_field *ofpact_put_reg_load2(struct ofpbuf *ofpacts,
+                                              const struct mf_field *,
+                                              const void *value,
+                                              const void *mask);
 
 /* OpenFlow 1.1 instructions.
  * The order is sorted in execution order. Not in the value of OFPIT11_xxx.
@@ -1109,5 +1253,9 @@ enum ofperr ovs_instruction_type_from_inst_type(
 ovs_be32 ovsinst_bitmap_to_openflow(uint32_t ovsinst_bitmap, enum ofp_version);
 uint32_t ovsinst_bitmap_from_openflow(ovs_be32 ofpit_bitmap,
                                       enum ofp_version);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* ofp-actions.h */

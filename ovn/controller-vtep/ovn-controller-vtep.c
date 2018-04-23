@@ -1,4 +1,4 @@
-/* Copyright (c) 2015 Nicira, Inc.
+/* Copyright (c) 2015, 2016 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,7 +27,7 @@
 #include "dirs.h"
 #include "openvswitch/dynamic-string.h"
 #include "fatal-signal.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "stream.h"
 #include "stream-ssl.h"
 #include "unixctl.h"
@@ -35,6 +35,7 @@
 #include "openvswitch/vconn.h"
 #include "openvswitch/vlog.h"
 #include "ovn/lib/ovn-sb-idl.h"
+#include "ovn/lib/ovn-util.h"
 #include "vtep/vtep-idl.h"
 
 #include "binding.h"
@@ -74,9 +75,6 @@ main(int argc, char *argv[])
                              &exiting);
 
     daemonize_complete();
-
-    vteprec_init();
-    sbrec_init();
 
     /* Connect to VTEP database. */
     struct ovsdb_idl_loop vtep_idl_loop = OVSDB_IDL_LOOP_INITIALIZER(
@@ -168,7 +166,8 @@ parse_options(int argc, char *argv[])
         OPT_PEER_CA_CERT = UCHAR_MAX + 1,
         OPT_BOOTSTRAP_CA_CERT,
         VLOG_OPTION_ENUMS,
-        DAEMON_OPTION_ENUMS
+        DAEMON_OPTION_ENUMS,
+        SSL_OPTION_ENUMS,
     };
 
     static struct option long_options[] = {
@@ -231,7 +230,7 @@ parse_options(int argc, char *argv[])
     free(short_options);
 
     if (!ovnsb_remote) {
-        ovnsb_remote = xstrdup(default_db());
+        ovnsb_remote = xstrdup(default_sb_db());
     }
 
     if (!vtep_remote) {

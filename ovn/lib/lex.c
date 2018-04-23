@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2016 Nicira, Inc.
+ * Copyright (c) 2015, 2016, 2017 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -89,7 +89,7 @@ lex_token_strcpy(struct lex_token *token, const char *s, size_t length)
                 ? token->buffer
                 : xmalloc(length + 1));
     memcpy(token->s, s, length);
-    token->buffer[length] = '\0';
+    token->s[length] = '\0';
 }
 
 void
@@ -229,6 +229,10 @@ lex_token_format(const struct lex_token *token, struct ds *s)
 
     case LEX_T_MACRO:
         ds_put_format(s, "$%s", token->s);
+        break;
+
+    case LEX_T_PORT_GROUP:
+        ds_put_format(s, "@%s", token->s);
         break;
 
     case LEX_T_LPAREN:
@@ -562,7 +566,7 @@ lex_parse_id(const char *p, enum lex_type type, struct lex_token *token)
 }
 
 static const char *
-lex_parse_macro(const char *p, struct lex_token *token)
+lex_parse_addr_set(const char *p, struct lex_token *token)
 {
     p++;
     if (!lex_is_id1(*p)) {
@@ -571,6 +575,18 @@ lex_parse_macro(const char *p, struct lex_token *token)
     }
 
     return lex_parse_id(p, LEX_T_MACRO, token);
+}
+
+static const char *
+lex_parse_port_group(const char *p, struct lex_token *token)
+{
+    p++;
+    if (!lex_is_id1(*p)) {
+        lex_error(token, "`@' must be followed by a valid identifier.");
+        return p;
+    }
+
+    return lex_parse_id(p, LEX_T_PORT_GROUP, token);
 }
 
 /* Initializes 'token' and parses the first token from the beginning of
@@ -589,7 +605,7 @@ next:
         token->type = LEX_T_END;
         return p;
 
-    case ' ': case '\t': case '\n': case '\r':
+    case ' ': case '\t': case '\n': case '\r': case '\v': case '\f':
         p++;
         goto next;
 
@@ -744,7 +760,11 @@ next:
         break;
 
     case '$':
-        p = lex_parse_macro(p, token);
+        p = lex_parse_addr_set(p, token);
+        break;
+
+    case '@':
+        p = lex_parse_port_group(p, token);
         break;
 
     case ':':
@@ -753,7 +773,8 @@ next:
             p++;
             break;
         }
-        /* IPv6 address beginning with "::".  Fall through. */
+        /* IPv6 address beginning with "::". */
+        /* fall through */
     case '0': case '1': case '2': case '3': case '4':
     case '5': case '6': case '7': case '8': case '9':
         p = lex_parse_integer(p, token);
@@ -803,6 +824,7 @@ lexer_init(struct lexer *lexer, const char *input)
     lexer->input = input;
     lexer->start = NULL;
     lex_token_init(&lexer->token);
+    lexer->error = NULL;
 }
 
 /* Frees storage associated with 'lexer'. */
@@ -810,6 +832,7 @@ void
 lexer_destroy(struct lexer *lexer)
 {
     lex_token_destroy(&lexer->token);
+    free(lexer->error);
 }
 
 /* Obtains the next token from 'lexer' into 'lexer->token', and returns the
@@ -851,6 +874,26 @@ lexer_match(struct lexer *lexer, enum lex_type type)
     }
 }
 
+bool
+lexer_force_match(struct lexer *lexer, enum lex_type t)
+{
+    if (t == LEX_T_END) {
+        return lexer_force_end(lexer);
+    } else if (lexer_match(lexer, t)) {
+        return true;
+    } else {
+        struct lex_token token = { .type = t };
+        struct ds s = DS_EMPTY_INITIALIZER;
+        lex_token_format(&token, &s);
+
+        lexer_syntax_error(lexer, "expecting `%s'", ds_cstr(&s));
+
+        ds_destroy(&s);
+
+        return false;
+    }
+}
+
 /* If 'lexer''s current token is the identifier given in 'id', advances 'lexer'
  * to the next token and returns true.  Otherwise returns false.  */
 bool
@@ -883,4 +926,96 @@ lexer_get_int(struct lexer *lexer, int *value)
         *value = 0;
         return false;
     }
+}
+
+bool
+lexer_force_int(struct lexer *lexer, int *value)
+{
+    bool ok = lexer_get_int(lexer, value);
+    if (!ok) {
+        lexer_syntax_error(lexer, "expecting small integer");
+    }
+    return ok;
+}
+
+bool
+lexer_force_end(struct lexer *lexer)
+{
+    if (lexer->token.type == LEX_T_END) {
+        return true;
+    } else {
+        lexer_syntax_error(lexer, "expecting end of input");
+        return false;
+    }
+}
+
+static bool
+lexer_error_handle_common(struct lexer *lexer)
+{
+    if (lexer->error) {
+        /* Already have an error, suppress this one since the cascade seems
+         * unlikely to be useful. */
+        return true;
+    } else if (lexer->token.type == LEX_T_ERROR) {
+        /* The lexer signaled an error.  Nothing at a higher level accepts an
+         * error token, so we'll inevitably end up here with some meaningless
+         * parse error.  Report the lexical error instead. */
+        lexer->error = xstrdup(lexer->token.s);
+        return true;
+    } else {
+        return false;
+    }
+}
+
+void OVS_PRINTF_FORMAT(2, 3)
+lexer_error(struct lexer *lexer, const char *message, ...)
+{
+    if (lexer_error_handle_common(lexer)) {
+        return;
+    }
+
+    va_list args;
+    va_start(args, message);
+    lexer->error = xvasprintf(message, args);
+    va_end(args);
+}
+
+void OVS_PRINTF_FORMAT(2, 3)
+lexer_syntax_error(struct lexer *lexer, const char *message, ...)
+{
+    if (lexer_error_handle_common(lexer)) {
+        return;
+    }
+
+    struct ds s;
+
+    ds_init(&s);
+    ds_put_cstr(&s, "Syntax error");
+    if (lexer->token.type == LEX_T_END) {
+        ds_put_cstr(&s, " at end of input");
+    } else if (lexer->start) {
+        ds_put_format(&s, " at `%.*s'",
+                      (int) (lexer->input - lexer->start),
+                      lexer->start);
+    }
+
+    if (message) {
+        ds_put_char(&s, ' ');
+
+        va_list args;
+        va_start(args, message);
+        ds_put_format_valist(&s, message, args);
+        va_end(args);
+    }
+    ds_put_char(&s, '.');
+
+    lexer->error = ds_steal_cstr(&s);
+}
+
+char *
+lexer_steal_error(struct lexer *lexer)
+{
+    char *error = lexer->error;
+    lexer->error = NULL;
+    return error;
 }

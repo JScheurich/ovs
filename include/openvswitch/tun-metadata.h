@@ -19,6 +19,10 @@
 
 #include "openvswitch/geneve.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define TUN_METADATA_NUM_OPTS 64
 #define TUN_METADATA_TOT_OPT_SIZE 256
 
@@ -48,7 +52,7 @@ struct tun_metadata {
         uint64_t map;                      /* 1-bit for each present TLV. */
         uint8_t len;                       /* Length of data in 'opts'. */
     } present;
-    struct tun_table *tab;      /* Types & lengths for 'opts' and 'opt_map'. */
+    const struct tun_table *tab; /* Types & lengths for 'opts' and 'opt_map'. */
 
 #if UINTPTR_MAX == UINT32_MAX
     uint8_t pad[4];             /* Pad to 64-bit boundary. */
@@ -87,7 +91,7 @@ struct tun_metadata_match_entry {
 };
 
 /* Allocation of options inside struct match.  This is important if we don't
- * have access to a global allocation table - either because there isn't one
+ * have access to an allocation table - either because there isn't one
  * (ovs-ofctl) or if we need to keep the allocation outside of packet
  * processing context (Packet-In). These structures never have dynamically
  * allocated memory because the address space is never fragmented. */
@@ -97,5 +101,13 @@ struct tun_metadata_allocation {
     bool valid;                 /* Set to true after any allocation occurs. */
 };
 
+struct tun_metadata_allocation *tun_metadata_allocation_clone(
+    const struct tun_metadata_allocation *);
+void tun_metadata_allocation_copy(struct tun_metadata_allocation *,
+                                  const struct tun_metadata_allocation *);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* tun-metadata.h */

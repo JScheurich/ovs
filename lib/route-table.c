@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2012, 2013, 2014 Nicira, Inc.
+ * Copyright (c) 2011, 2012, 2013, 2014, 2017 Nicira, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,6 +19,8 @@
 #include "route-table.h"
 
 #include <errno.h>
+#include <sys/types.h>
+#include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <linux/rtnetlink.h>
@@ -33,18 +35,25 @@
 #include "ovs-router.h"
 #include "packets.h"
 #include "rtnetlink.h"
+#include "tnl-ports.h"
 #include "openvswitch/vlog.h"
+
+/* Linux 2.6.36 added RTA_MARK, so define it just in case we're building with
+ * old headers.  (We can't test for it with #ifdef because it's an enum.) */
+#define RTA_MARK 16
 
 VLOG_DEFINE_THIS_MODULE(route_table);
 
 struct route_data {
     /* Copied from struct rtmsg. */
     unsigned char rtm_dst_len;
+    bool local;
 
     /* Extracted from Netlink attributes. */
     struct in6_addr rta_dst; /* 0 if missing. */
     struct in6_addr rta_gw;
     char ifname[IFNAMSIZ]; /* Interface name. */
+    uint32_t mark;
 };
 
 /* A digested version of a route message sent down by the kernel to indicate
@@ -147,7 +156,7 @@ static int
 route_table_reset(void)
 {
     struct nl_dump dump;
-    struct rtgenmsg *rtmsg;
+    struct rtgenmsg *rtgenmsg;
     uint64_t reply_stub[NL_DUMP_BUFSIZE / 8];
     struct ofpbuf request, reply, buf;
 
@@ -158,10 +167,11 @@ route_table_reset(void)
 
     ofpbuf_init(&request, 0);
 
-    nl_msg_put_nlmsghdr(&request, sizeof *rtmsg, RTM_GETROUTE, NLM_F_REQUEST);
+    nl_msg_put_nlmsghdr(&request, sizeof *rtgenmsg, RTM_GETROUTE,
+                        NLM_F_REQUEST);
 
-    rtmsg = ofpbuf_put_zeros(&request, sizeof *rtmsg);
-    rtmsg->rtgen_family = AF_UNSPEC;
+    rtgenmsg = ofpbuf_put_zeros(&request, sizeof *rtgenmsg);
+    rtgenmsg->rtgen_family = AF_UNSPEC;
 
     nl_dump_start(&dump, NETLINK_ROUTE, &request);
     ofpbuf_uninit(&request);
@@ -188,13 +198,15 @@ route_table_parse(struct ofpbuf *buf, struct route_table_msg *change)
 
     static const struct nl_policy policy[] = {
         [RTA_DST] = { .type = NL_A_U32, .optional = true  },
-        [RTA_OIF] = { .type = NL_A_U32, .optional = false },
+        [RTA_OIF] = { .type = NL_A_U32, .optional = true },
         [RTA_GATEWAY] = { .type = NL_A_U32, .optional = true },
+        [RTA_MARK] = { .type = NL_A_U32, .optional = true },
     };
 
     static const struct nl_policy policy6[] = {
         [RTA_DST] = { .type = NL_A_IPV6, .optional = true },
         [RTA_OIF] = { .type = NL_A_U32, .optional = true },
+        [RTA_MARK] = { .type = NL_A_U32, .optional = true },
         [RTA_GATEWAY] = { .type = NL_A_IPV6, .optional = true },
     };
 
@@ -234,6 +246,7 @@ route_table_parse(struct ofpbuf *buf, struct route_table_msg *change)
         }
         change->nlmsg_type     = nlmsg->nlmsg_type;
         change->rd.rtm_dst_len = rtm->rtm_dst_len + (ipv4 ? 96 : 0);
+        change->rd.local = rtm->rtm_type == RTN_LOCAL;
         if (attrs[RTA_OIF]) {
             rta_oif = nl_attr_get_u32(attrs[RTA_OIF]);
 
@@ -270,6 +283,9 @@ route_table_parse(struct ofpbuf *buf, struct route_table_msg *change)
                 change->rd.rta_gw = nl_attr_get_in6_addr(attrs[RTA_GATEWAY]);
             }
         }
+        if (attrs[RTA_MARK]) {
+            change->rd.mark = nl_attr_get_u32(attrs[RTA_MARK]);
+        }
     } else {
         VLOG_DBG_RL(&rl, "received unparseable rtnetlink route message");
         return 0;
@@ -292,8 +308,8 @@ route_table_handle_msg(const struct route_table_msg *change)
     if (change->relevant && change->nlmsg_type == RTM_NEWROUTE) {
         const struct route_data *rd = &change->rd;
 
-        ovs_router_insert(&rd->rta_dst, rd->rtm_dst_len,
-                          rd->ifname, &rd->rta_gw);
+        ovs_router_insert(rd->mark, &rd->rta_dst, rd->rtm_dst_len,
+                          rd->local, rd->ifname, &rd->rta_gw);
     }
 }
 
@@ -323,10 +339,16 @@ name_table_init(void)
 
 
 static void
-name_table_change(const struct rtnetlink_change *change OVS_UNUSED,
+name_table_change(const struct rtnetlink_change *change,
                   void *aux OVS_UNUSED)
 {
     /* Changes to interface status can cause routing table changes that some
      * versions of the linux kernel do not advertise for some reason. */
     route_table_valid = false;
+
+    if (change && change->nlmsg_type == RTM_DELLINK) {
+        if (change->ifname) {
+            tnl_port_map_delete_ipdev(change->ifname);
+        }
+    }
 }

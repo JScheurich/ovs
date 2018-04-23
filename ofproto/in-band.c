@@ -15,6 +15,8 @@
  */
 
 #include <config.h>
+#include <sys/types.h>
+#include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <inttypes.h>
@@ -36,7 +38,7 @@
 #include "openvswitch/ofpbuf.h"
 #include "openvswitch/vlog.h"
 #include "packets.h"
-#include "poll-loop.h"
+#include "openvswitch/poll-loop.h"
 #include "timeval.h"
 
 VLOG_DEFINE_THIS_MODULE(in_band);
@@ -119,9 +121,11 @@ refresh_remote(struct in_band *ib, struct in_band_remote *r)
     retval = netdev_get_next_hop(ib->local_netdev, &r->remote_addr.sin_addr,
                                  &next_hop_inaddr, &next_hop_dev);
     if (retval) {
-        VLOG_WARN("%s: cannot find route for controller ("IP_FMT"): %s",
-                  ib->ofproto->name, IP_ARGS(r->remote_addr.sin_addr.s_addr),
-                  ovs_strerror(retval));
+        VLOG_WARN_RL(&rl, "%s: cannot find route for controller "
+                     "("IP_FMT"): %s",
+                     ib->ofproto->name,
+                     IP_ARGS(r->remote_addr.sin_addr.s_addr),
+                     ovs_strerror(retval));
         return 1;
     }
     if (!next_hop_inaddr.s_addr) {
@@ -395,7 +399,9 @@ in_band_run(struct in_band *ib)
             break;
 
         case DEL:
+            ovs_mutex_lock(&ofproto_mutex);
             ofproto_delete_flow(ib->ofproto, &rule->match, rule->priority);
+            ovs_mutex_unlock(&ofproto_mutex);
             hmap_remove(&ib->rules, &rule->hmap_node);
             free(rule);
             break;
@@ -422,7 +428,7 @@ in_band_create(struct ofproto *ofproto, const char *local_name,
     struct in_band *in_band;
     struct netdev *local_netdev;
     int error;
-    const char *type = ofproto_port_open_type(ofproto->type, "internal");
+    const char *type = ofproto_port_open_type(ofproto, "internal");
 
     *in_bandp = NULL;
     error = netdev_open(local_name, type, &local_netdev);

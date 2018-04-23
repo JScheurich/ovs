@@ -51,6 +51,7 @@ struct conn_tcp {
     struct OVS_CT_ENTRY up;
     struct tcp_peer peer[2];
 };
+C_ASSERT(offsetof(struct conn_tcp, up) == 0);
 
 enum {
     TCPOPT_EOL,
@@ -184,29 +185,6 @@ OvsTcpGetWscale(const TCPHdr *tcp)
     return wscale;
 }
 
-static __inline uint32_t
-OvsGetTcpPayloadLength(PNET_BUFFER_LIST nbl)
-{
-    IPHdr *ipHdr;
-    char *ipBuf[sizeof(IPHdr)];
-    PNET_BUFFER curNb;
-    curNb = NET_BUFFER_LIST_FIRST_NB(nbl);
-    ipHdr = NdisGetDataBuffer(curNb, sizeof *ipHdr, (PVOID) &ipBuf,
-                                                    1 /*no align*/, 0);
-    TCPHdr *tcp = (TCPHdr *)((PCHAR)ipHdr + ipHdr->ihl * 4);
-    return (UINT16)ntohs(ipHdr->tot_len)
-                        - (ipHdr->ihl * 4)
-                        - (sizeof * tcp);
-}
-
-static __inline void
-OvsConntrackUpdateExpiration(struct conn_tcp *conn,
-                             long long now,
-                             long long interval)
-{
-    conn->up.expiration = now + interval;
-}
-
 static __inline struct conn_tcp*
 OvsCastConntrackEntryToTcpEntry(OVS_CT_ENTRY* conn)
 {
@@ -226,13 +204,13 @@ OvsConntrackUpdateTcpEntry(OVS_CT_ENTRY* conn_,
     /* The peer that should receive 'pkt' */
     struct tcp_peer *dst = &conn->peer[reply ? 0 : 1];
     uint8_t sws = 0, dws = 0;
-    UINT16 tcp_flags = tcp->flags;
+    UINT16 tcp_flags = ntohs(tcp->flags);
     uint16_t win = ntohs(tcp->window);
     uint32_t ack, end, seq, orig_seq;
     uint32_t p_len = OvsGetTcpPayloadLength(nbl);
     int ackskew;
 
-    if (OvsCtInvalidTcpFlags(tcp->flags)) {
+    if (OvsCtInvalidTcpFlags(tcp_flags)) {
         return CT_UPDATE_INVALID;
     }
 
@@ -268,7 +246,7 @@ OvsConntrackUpdateTcpEntry(OVS_CT_ENTRY* conn_,
     if (src->state < CT_DPIF_TCPS_SYN_SENT) {
         /* First packet from this end. Set its state */
 
-        ack = ntohl(tcp->ack);
+        ack = ntohl(tcp->ack_seq);
 
         end = seq + p_len;
         if (tcp_flags & TCP_SYN) {
@@ -308,7 +286,7 @@ OvsConntrackUpdateTcpEntry(OVS_CT_ENTRY* conn_,
         }
 
     } else {
-        ack = ntohl(tcp->ack);
+        ack = ntohl(tcp->ack_seq);
         end = seq + p_len;
         if (tcp_flags & TCP_SYN) {
             end++;
@@ -383,18 +361,23 @@ OvsConntrackUpdateTcpEntry(OVS_CT_ENTRY* conn_,
 
         if (src->state >= CT_DPIF_TCPS_FIN_WAIT_2
             && dst->state >= CT_DPIF_TCPS_FIN_WAIT_2) {
-            OvsConntrackUpdateExpiration(conn, now, 30 * CT_INTERVAL_SEC);
+            OvsConntrackUpdateExpiration(&conn->up, now,
+                                         30 * CT_INTERVAL_SEC);
         } else if (src->state >= CT_DPIF_TCPS_CLOSING
                    && dst->state >= CT_DPIF_TCPS_CLOSING) {
-            OvsConntrackUpdateExpiration(conn, now, 45 * CT_INTERVAL_SEC);
+            OvsConntrackUpdateExpiration(&conn->up, now,
+                                         45 * CT_INTERVAL_SEC);
         } else if (src->state < CT_DPIF_TCPS_ESTABLISHED
                    || dst->state < CT_DPIF_TCPS_ESTABLISHED) {
-            OvsConntrackUpdateExpiration(conn, now, 30 * CT_INTERVAL_SEC);
+            OvsConntrackUpdateExpiration(&conn->up, now,
+                                         30 * CT_INTERVAL_SEC);
         } else if (src->state >= CT_DPIF_TCPS_CLOSING
                    || dst->state >= CT_DPIF_TCPS_CLOSING) {
-            OvsConntrackUpdateExpiration(conn, now, 15 * 60 * CT_INTERVAL_SEC);
+            OvsConntrackUpdateExpiration(&conn->up, now,
+                                         15 * 60 * CT_INTERVAL_SEC);
         } else {
-            OvsConntrackUpdateExpiration(conn, now, 24 * 60 * 60 * CT_INTERVAL_SEC);
+            OvsConntrackUpdateExpiration(&conn->up, now,
+                                         24 * 60 * 60 * CT_INTERVAL_SEC);
         }
     } else if ((dst->state < CT_DPIF_TCPS_SYN_SENT
                 || dst->state >= CT_DPIF_TCPS_FIN_WAIT_2
@@ -460,14 +443,24 @@ OvsConntrackUpdateTcpEntry(OVS_CT_ENTRY* conn_,
 BOOLEAN
 OvsConntrackValidateTcpPacket(const TCPHdr *tcp)
 {
-    if (tcp == NULL || OvsCtInvalidTcpFlags(tcp->flags)) {
+    if (!tcp) {
+        OVS_LOG_TRACE("Invalid TCP packet detected, header cannot be NULL");
+        return FALSE;
+    }
+
+    UINT16 tcp_flags = ntohs(tcp->flags);
+
+    if (OvsCtInvalidTcpFlags(tcp_flags)) {
+        OVS_LOG_TRACE("Invalid TCP packet detected, tcp_flags %hu", tcp_flags);
         return FALSE;
     }
 
     /* A syn+ack is not allowed to create a connection.  We want to allow
      * totally new connections (syn) or already established, not partially
      * open (syn+ack). */
-    if ((tcp->flags & TCP_SYN) && (tcp->flags & TCP_ACK)) {
+    if ((tcp_flags & TCP_SYN) && (tcp_flags & TCP_ACK)) {
+        OVS_LOG_TRACE("Invalid TCP packet detected, SYN+ACK flags not allowed,"
+                      "tcp_flags %hu", tcp_flags);
         return FALSE;
     }
 
@@ -516,7 +509,7 @@ OvsConntrackCreateTcpEntry(const TCPHdr *tcp,
     src->state = CT_DPIF_TCPS_SYN_SENT;
     dst->state = CT_DPIF_TCPS_CLOSED;
 
-    OvsConntrackUpdateExpiration(newconn, now, CT_ENTRY_TIMEOUT);
+    OvsConntrackUpdateExpiration(&newconn->up, now, CT_ENTRY_TIMEOUT);
 
     return &newconn->up;
 }

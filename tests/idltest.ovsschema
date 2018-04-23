@@ -34,7 +34,8 @@
             "min": 0
           }
         }
-      }
+      },
+      "isRoot" : true
     },
     "link2": {
       "columns": {
@@ -50,7 +51,8 @@
             "min": 0
           }
         }
-      }
+      },
+      "isRoot" : true
     },
     "simple": {
       "columns": {
@@ -104,7 +106,8 @@
             "min": 0
           }
         }
-      }
+      },
+      "isRoot" : true
     },
     "simple2" : {
       "columns" : {
@@ -133,7 +136,40 @@
             "max": "unlimited"
           }
         }
-      }
+      },
+      "isRoot" : true
+    },
+    "simple3" : {
+      "columns" : {
+        "name" : {
+          "type": "string"
+        },
+        "uset": {
+          "type": {
+             "key": {"type": "uuid"},
+             "min": 0,
+             "max": "unlimited"
+          }
+        },
+        "uref": {
+          "type": {
+             "key": {"type": "uuid",
+                     "refTable": "simple4",
+                     "refType": "strong"},
+             "min": 0,
+             "max": "unlimited"
+          }
+        }
+      },
+      "isRoot" : true
+    },
+    "simple4" : {
+      "columns" : {
+        "name" : {
+          "type": "string"
+        }
+      },
+      "isRoot" : false
     }
   }
 }

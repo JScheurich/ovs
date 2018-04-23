@@ -32,6 +32,7 @@ prt==1 { sub(/[ \t]*$/, ""); print $0 }
 vconn_sub() {
     sed '
 s/tcp:127.0.0.1:[0-9][0-9]*:/unix:/
+s/unix#[0-9]*:/unix:/
 '
 }
 ]
@@ -54,8 +55,8 @@ m4_define([PARSE_LISTENING_PORT],
 
 start_daemon () {
     "$@" -vconsole:off --detach --no-chdir --pidfile --log-file
-    pid=`cat "$OVS_RUNDIR"/$1.pid`
-    on_exit "kill $pid"
+    pidfile="$OVS_RUNDIR"/$1.pid
+    on_exit "test -e \"$pidfile\" && kill \`cat \"$pidfile\"\`"
 }
 
 # sim_add SANDBOX
@@ -106,7 +107,7 @@ sim_add () {
 # there.
 as() {
     if test "X$2" != X; then
-        (ovs_setenv $1; shift; $@)
+        (ovs_setenv $1; shift; "$@")
     else
         ovs_setenv $1
     fi
@@ -156,6 +157,9 @@ m4_define([OVN_CLEANUP],[
     as northd
     OVS_APP_EXIT_AND_WAIT([ovn-northd])
 
+    as northd-backup
+    OVS_APP_EXIT_AND_WAIT([ovn-northd])
+
     OVN_CLEANUP_VSWITCH([main])
 ])
 
@@ -191,6 +195,12 @@ ovn_start () {
     echo "starting ovn-northd"
     mkdir "$ovs_base"/northd
     as northd start_daemon ovn-northd \
+               --ovnnb-db=unix:"$ovs_base"/ovn-nb/ovn-nb.sock \
+               --ovnsb-db=unix:"$ovs_base"/ovn-sb/ovn-sb.sock
+
+    echo "starting backup ovn-northd"
+    mkdir "$ovs_base"/northd-backup
+    as northd-backup start_daemon ovn-northd \
                --ovnnb-db=unix:"$ovs_base"/ovn-nb/ovn-nb.sock \
                --ovnsb-db=unix:"$ovs_base"/ovn-sb/ovn-sb.sock
 }
@@ -261,23 +271,24 @@ ovn_attach() {
     start_daemon ovn-controller || return 1
 }
 
-# ovn_populate_arp
+# OVN_POPULATE_ARP
 #
 # This pre-populates the ARP tables of all of the OVN instances that have been
 # started with ovn_attach().  That means that packets sent from one hypervisor
 # to another never get dropped or delayed by ARP resolution, which makes
 # testing easier.
-ovn_populate_arp() {
+ovn_populate_arp__() {
     for e1 in $arp_table; do
         set `echo $e1 | sed 's/,/ /g'`; sb1=$1 br1=$2 ip=$3 mac=$4
         for e2 in $arp_table; do
             set `echo $e2 | sed 's/,/ /g'`; sb2=$1 br2=$2
             if test $sb1,$br1 != $sb2,$br2; then
-                as $sb2 ovs-appctl tnl/neigh/set $br2 $ip $mac
+                as $sb2 ovs-appctl tnl/neigh/set $br2 $ip $mac || return 1
             fi
         done
     done
 }
+m4_define([OVN_POPULATE_ARP], [AT_CHECK(ovn_populate_arp__, [0], [ignore])])
 
 # Strips 'xid=0x1234' from ovs-ofctl output.
 strip_xids () {
@@ -317,21 +328,25 @@ m4_define([_OVS_VSWITCHD_START],
    AT_CAPTURE_FILE([ovsdb-server.log])
 
    dnl Initialize database.
-   AT_CHECK([ovs-vsctl --no-wait init])
+   AT_CHECK([ovs-vsctl --no-wait init $2])
 
    dnl Start ovs-vswitchd.
    AT_CHECK([ovs-vswitchd $1 --detach --no-chdir --pidfile --log-file -vvconn -vofproto_dpif -vunixctl], [0], [], [stderr])
    AT_CAPTURE_FILE([ovs-vswitchd.log])
-   on_exit "kill `cat ovs-vswitchd.pid`"
+   on_exit "kill_ovs_vswitchd `cat ovs-vswitchd.pid`"
    AT_CHECK([[sed < stderr '
 /ovs_numa|INFO|Discovered /d
 /vlog|INFO|opened log file/d
 /vswitchd|INFO|ovs-vswitchd (Open vSwitch)/d
 /reconnect|INFO|/d
+/dpif_netlink|INFO|Generic Netlink family .ovs_datapath. does not exist/d
 /ofproto|INFO|using datapath ID/d
 /netdev_linux|INFO|.*device has unknown hardware address family/d
 /ofproto|INFO|datapath ID changed to fedcba9876543210/d
-/dpdk|INFO|DPDK Disabled - to change this requires a restart./d']])
+/dpdk|INFO|DPDK Disabled - Use other_config:dpdk-init to enable/d
+/netlink_socket|INFO|netlink: could not enable listening to all nsid/d
+/netdev: Flow API/d
+/tc: Using policy/d']])
 ])
 
 # OVS_VSWITCHD_START([vsctl-args], [vsctl-output], [=override],
@@ -342,7 +357,7 @@ m4_define([_OVS_VSWITCHD_START],
 # br0 with predictable settings, passing 'vsctl-args' as additional
 # commands to ovs-vsctl.  If 'vsctl-args' causes ovs-vsctl to provide
 # output (e.g. because it includes "create" commands) then 'vsctl-output'
-# specifies the expected output after filtering through uuidfilt.pl.
+# specifies the expected output after filtering through uuidfilt.
 #
 # If a test needs to use "system" devices (as dummies), then specify
 # =override (literally) as the third argument.  Otherwise, system devices
@@ -353,7 +368,7 @@ m4_define([_OVS_VSWITCHD_START],
 # to ovs-vswitchd
 m4_define([OVS_VSWITCHD_START],
   [_OVS_VSWITCHD_START([--enable-dummy$3 --disable-system $4])
-   AT_CHECK([add_of_br 0 $1 m4_if([$2], [], [], [| ${PERL} $srcdir/uuidfilt.pl])], [0], [$2])
+   AT_CHECK([add_of_br 0 $1 m4_if([$2], [], [], [| uuidfilt])], [0], [$2])
 ])
 
 # check_logs scans through all *.log files (except '*.log' and testsuite.log)
@@ -369,7 +384,19 @@ check_logs () {
         esac
     done
 
+    # We most notably ignore 'Broken pipe' warnings.  These often and
+    # intermittently appear in ovsdb-server.log, because *ctl commands
+    # (e.g. ovs-vsctl, ovn-nbctl) exit right after committing a change to the
+    # database.  However, in reaction, some daemon may immediately update the
+    # database, and this later update may cause database sending update back to
+    # *ctl command if *ctl has not exited yet.  If *ctl command exits before
+    # the database calls send, the send fails with 'Broken pipe'.  Also removes
+    # all "connection reset" warning logs for similar reasons (either EPIPE or
+    # ECONNRESET can be returned on a send depending on whether the peer had
+    # unconsumed data when it closed the socket).
     sed -n "$1
+/reset by peer/d
+/Broken pipe/d
 /timeval.*Unreasonably long [[0-9]]*ms poll interval/d
 /timeval.*faults: [[0-9]]* minor, [[0-9]]* major/d
 /timeval.*disk: [[0-9]]* reads, [[0-9]]* writes/d
@@ -455,9 +482,8 @@ m4_define([OVS_VSWITCHD_STOP],
    OVS_APP_EXIT_AND_WAIT([ovsdb-server])])
 
 m4_define([OVS_VSWITCHD_DISABLE_TUNNEL_PUSH_POP],
-  [AT_CHECK([ovs-appctl ofproto/tnl-push-pop off], [0], [dnl
-Tunnel push-pop off
-])])
+  [AT_CHECK([ovs-appctl dpif/set-dp-features br0 tnl_push_pop false], [0])
+])
 
 # WAIT_FOR_DUMMY_PORTS(NETDEV_DUMMY_PORT[, NETDEV_DUMMY_PORT...])
 #
@@ -468,46 +494,4 @@ m4_define([WAIT_FOR_DUMMY_PORTS], \
 	 OVS_WAIT_WHILE([ovs-appctl netdev-dummy/conn-state dummy_port \
                   | grep 'unknown\|disconnected'])])])
 
-# OVS_MONITOR_IPSEC_START()
-#
-# Starts ovs-monitor-ipsec daemon.  Use this macro only after testing
-# that python is present on the system.
-m4_define([OVS_MONITOR_IPSEC_START],
-[
-cp "$top_srcdir/vswitchd/vswitch.ovsschema" .
 
-on_exit 'kill `cat pid ovs-monitor-ipsec.pid`'
-
-mkdir etc etc/init.d etc/racoon etc/racoon/certs
-mkdir usr usr/sbin
-
-AT_DATA([etc/init.d/racoon], [dnl
-#! /bin/sh
-echo "racoon: @S|@@" >&3
-exit 0
-])
-chmod +x etc/init.d/racoon
-
-AT_DATA([usr/sbin/setkey], [dnl
-#! /bin/sh
-exec >&3
-echo "setkey:"
-while read line; do
-      echo "> $line"
-done
-])
-chmod +x usr/sbin/setkey
-
-touch etc/racoon/certs/ovs-stale.pem
-
-###
-### Start ovs-monitor-ipsec and wait for it to delete the stale cert.
-###
-AT_CHECK(
-  [$PYTHON $top_srcdir/debian/ovs-monitor-ipsec "--root-prefix=`pwd`" \
-        "--pidfile=`pwd`/ovs-monitor-ipsec.pid" \
-        unix:$OVS_RUNDIR/db.sock 2>log 3>actions &])
-AT_CAPTURE_FILE([log])
-AT_CAPTURE_FILE([actions])
-OVS_WAIT_UNTIL([test ! -f etc/racoon/certs/ovs-stale.pem])
-])
